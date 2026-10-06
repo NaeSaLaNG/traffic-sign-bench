@@ -16,7 +16,7 @@
 
 Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Driving
 
-[![Paper](https://img.shields.io/badge/Paper-arXiv-B31B1B?style=flat-square&logo=arxiv&logoColor=white)](https://emb-ai.github.io/traffic-sign-bench/)
+[![Paper](https://img.shields.io/badge/Paper-arXiv-B31B1B?style=flat-square&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.38463)
 [![Project](https://img.shields.io/badge/Project-Website-334155?style=flat-square&logo=githubpages&logoColor=white)](https://emb-ai.github.io/traffic-sign-bench/)
 [![Dataset](https://img.shields.io/badge/Dataset-Hugging_Face-334155?style=flat-square&logo=huggingface&logoColor=FFD21E)](https://huggingface.co/datasets/emb-ai/traffic-sign-bench)
 [![Models](https://img.shields.io/badge/Models-Hugging_Face-334155?style=flat-square&logo=huggingface&logoColor=FFD21E)](https://huggingface.co/emb-ai/traffic-rule-bench-models)
@@ -27,7 +27,7 @@ Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Dri
 
 ## <img src="assets/signs/detour_right.png" alt="" height="23"/> News
 
-- **[2026]** Our paper is now available on arXiv! Check out the [video demo](https://emb-ai.github.io/traffic-sign-bench/).
+- **[2026-09-29]** Our paper is now available on [arXiv](https://arxiv.org/abs/2609.38463)! Check out the [video demo](https://emb-ai.github.io/traffic-sign-bench/).
 - **[2026-09-28]** TrafficSignBench code is out! Run the Quick start test below, or evaluate your own planner on the [released scenes](https://huggingface.co/datasets/emb-ai/traffic-sign-bench) and [checkpoints](https://huggingface.co/emb-ai/traffic-rule-bench-models).
 
 
