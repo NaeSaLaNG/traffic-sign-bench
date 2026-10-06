@@ -289,11 +289,14 @@ checkpoints/             # downloaded planner weights (gitignored)
 If TrafficSignBench is useful in your research, please cite:
 
 ```bibtex
-@misc{trafficsignbench2026,
-  title     = {TrafficSignBench: Evaluating Traffic Rule Compliance in Autonomous Driving},
-  year      = {2026},
-  publisher = {\url{https://github.com/emb-ai/traffic-sign-bench}},
-  note      = {Code, scenes, and models}
+@misc{smirnova2026trafficsignbenchrulecentricclosedloopevaluation,
+  title         = {TrafficSignBench: Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Driving},
+  author        = {Victoria Smirnova and Viktoriia Zinkovich and Gregorii Bukhtuev and Artem Belyaev and Andrey Kuznetsov and Denis Shepelev and Vlad Shakhuro},
+  year          = {2026},
+  eprint        = {2609.38463},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO},
+  url           = {https://arxiv.org/abs/2609.38463}
 }
 ```
 
@@ -302,9 +305,13 @@ If TrafficSignBench is useful in your research, please cite:
 
 ## <img src="assets/signs/one_way.png" alt="" height="23"/> Acknowledgements
 
-Built on [MetaDrive](https://github.com/metadriverse/metadrive) and
-[SUMO](https://eclipse.dev/sumo/), with planners from
-[CaRL](https://github.com/autonomousvision/CaRL) and
-[PlanT-2](https://github.com/emb-ai/plant2). Maps come from
-[OpenStreetMap](https://www.openstreetmap.org/) contributors; scenario distributions are
-calibrated on [nuPlan](https://www.nuscenes.org/nuplan). 
+We are grateful to the communities and authors of the open projects this benchmark is built on:
+
+- [MetaDrive](https://github.com/metadriverse/metadrive) — the driving simulator we extend with traffic signs and rule checkers
+- [SUMO](https://github.com/eclipse-sumo/sumo) — road networks and traffic simulation
+- [CaRL](https://github.com/autonomousvision/CaRL) — released planner we evaluate
+- [PlanT-2](https://github.com/emb-ai/plant2) — released planner we evaluate and fine-tune
+- [OpenStreetMap](https://www.openstreetmap.org/) — real-world maps
+- [nuPlan](https://github.com/motional/nuplan-devkit) — driving statistics used to calibrate scenario distributions
+
+Thank you to everyone whose open tools, data, and models made this work possible. 
