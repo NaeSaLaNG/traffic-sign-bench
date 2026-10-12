@@ -128,11 +128,13 @@ Released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Please
 ## Citation
 
 ```bibtex
-@misc{trafficsignbench2026,
-  title     = {TrafficSignBench: Evaluating Traffic Rule Compliance
-               in Autonomous Driving},
-  year      = {2026},
-  publisher = {GitHub},
-  url       = {https://github.com/emb-ai/traffic-sign-bench}
+@misc{smirnova2026trafficsignbenchrulecentricclosedloopevaluation,
+  title         = {TrafficSignBench: Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Driving},
+  author        = {Victoria Smirnova and Viktoriia Zinkovich and Gregorii Bukhtuev and Artem Belyaev and Andrey Kuznetsov and Denis Shepelev and Vlad Shakhuro},
+  year          = {2026},
+  eprint        = {2609.38463},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO},
+  url           = {https://arxiv.org/abs/2609.38463}
 }
 ```
