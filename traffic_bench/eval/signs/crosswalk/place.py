@@ -402,11 +402,20 @@ def _invalidate_topdown_background(env) -> None:
     """Force the next top-down render to rebake the map (crosswalks changed)."""
     # Recreate TopDownRenderer on next render() so the baked background picks up
     # the replaced zebra (background is otherwise immutable after first paint).
-    if hasattr(env, "top_down_renderer"):
+    # ``env.top_down_renderer`` is a read-only property; clear the engine slot.
+    engine = getattr(env, "engine", None)
+    if engine is None:
+        return
+    renderer = getattr(engine, "top_down_renderer", None)
+    if renderer is not None:
         try:
-            env.top_down_renderer = None
+            renderer.clear()
         except Exception:
             pass
+    try:
+        engine.top_down_renderer = None
+    except Exception:
+        pass
 
 
 def install_segment_crosswalk_geometry(env, row: dict) -> bool:

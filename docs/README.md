@@ -2,26 +2,68 @@
 
 Static GitHub Pages site with no build-time JavaScript dependencies.
 
-## Local preview
+## Live MetaDrive challenge gallery
 
 ```bash
-python -m http.server 8000 --directory docs
+conda activate trafficsignbench
+pip install -e ".[demo]"
+
+# Requires the yield, crosswalk, blocked_road, and main_road run/scene subsets.
+# Maximum-speed and detour demos reuse compatible Moscow roads from
+# blocked_road and main_road respectively.
+bash tools/run_live_demo.sh
 ```
 
-Then open <http://localhost:8000>.
+Then open <http://localhost:8765>. The server hosts the static site and one
+real MetaDrive session selected from four traffic-sign challenges (yield,
+crosswalk, detour, maximum speed). Arrow-key state is sent over a WebSocket;
+the server steps the benchmark environment, runs the matching executable
+checker, and returns 10 FPS square top-down JPEG frames plus live telemetry.
+
+Only one driver is accepted at a time. This is intentional for the MVP because
+MetaDrive/Panda3D has process-global state. A multi-user deployment should use
+one worker process per session.
+
+Run a simulator/rendering smoke test without opening a port:
+
+```bash
+python -m traffic_bench.demo.server --smoke-test
+```
 
 ## Structure
 
 - `index.html` — semantic page content and metadata
 - `static/css/style.css` — responsive light-theme design
-- `static/js/main.js` — navigation, reveal effects, citation copy, and the
-  browser-only interactive rule checker
+- `static/js/main.js` — navigation, reveal effects, and citation copy
+- `static/js/live-simulator.js` — WebSocket video, telemetry, and controls
 - `static/media/` — teaser GIF, project video, and video poster
 - `tools/build_site_media.sh` — reproducible media export from
   `video/out/final.mp4`
 
-The driving playground is deterministic and runs entirely in the browser. It
-does not load MetaDrive or call a backend, so it works on GitHub Pages.
+The old browser-only toy remains in `static/js/simulator.js` for reference but
+is no longer loaded.
+
+## Public deployment
+
+GitHub Pages cannot run Python. Keep the site there, run
+`tools/run_live_demo.sh` on a compute node, and expose `/api/drive` through an
+HTTPS reverse proxy that supports WebSocket upgrades. Then set this tag in
+`index.html`:
+
+```html
+<meta name="traffic-bench-demo-ws"
+      content="wss://demo.example.org/api/drive">
+```
+
+Allow that site origin on the server:
+
+```bash
+bash tools/run_live_demo.sh \
+  --allowed-origin https://emb-ai.github.io
+```
+
+The backend is deliberately single-session and has no authentication. Put
+rate limiting and TLS at the reverse proxy before exposing it publicly.
 
 ## Rebuild media
 
@@ -36,4 +78,5 @@ progressive playback, and exports the poster.
 ## GitHub Pages
 
 Configure **Settings → Pages → Deploy from a branch**, using `main` and
-`/docs`. The committed `.nojekyll` file keeps the static paths unchanged.
+`/docs`. The committed `.nojekyll` file keeps the static paths unchanged. The
+live section also needs the public `wss://` backend URL described above.

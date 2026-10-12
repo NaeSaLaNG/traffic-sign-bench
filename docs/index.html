@@ -11,6 +11,9 @@
   <meta property="og:image" content="https://emb-ai.github.io/traffic-sign-bench/static/media/video-poster.jpg">
   <meta property="og:url" content="https://emb-ai.github.io/traffic-sign-bench/">
   <meta name="twitter:card" content="summary_large_image">
+  <!-- Set content to the deployed backend, e.g. wss://demo.example.org/api/drive.
+       Empty means same-origin, which is used by the local MVP server. -->
+  <meta name="traffic-bench-demo-ws" content="">
   <title>TrafficSignBench — Rule-centric evaluation for autonomous driving</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -18,7 +21,7 @@
   <link rel="icon" href="static/images/signs/5.19.png">
   <link rel="stylesheet" href="static/css/style.css">
   <script src="static/js/main.js" defer></script>
-  <script src="static/js/simulator.js" defer></script>
+  <script src="static/js/live-simulator.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -121,45 +124,57 @@
     <section class="section drive" id="drive">
       <div class="shell drive__heading">
         <div>
-          <p class="section-label">Interactive stop-sign scenario</p>
+          <p class="section-label">Live MetaDrive · 4 Moscow challenges</p>
           <h2 class="drive__title">Think you can <span>obey <br>the sign?</span></h2>
         </div>
-        <p>Take control of the ego vehicle with continuous steering, throttle, and braking. The benchmark checker runs alongside you, entirely in your browser.</p>
+        <p>Pick a sign, take the wheel, and see whether the benchmark agrees with your interpretation of the rule. Every challenge runs in a real Moscow scene with an executable checker.</p>
       </div>
 
       <div class="shell simulator reveal">
         <div class="simulator__bar">
-          <div><span class="simulator__live-dot"></span> Browser simulation</div>
-          <span>Stop sign · junction scene</span>
+          <div><span class="simulator__live-dot"></span> <span id="sim-connection">Ready to connect</span></div>
+          <span id="sim-scenario-label">Moscow challenge · sign 2.4</span>
         </div>
         <div class="simulator__body">
+          <nav class="scenario-picker" aria-label="Choose a traffic-sign challenge">
+            <button class="is-active" type="button" data-scenario="yield" aria-label="Yield challenge" title="Yield · 2.4" aria-pressed="true"><img src="static/images/signs/2.4.png" alt=""></button>
+            <button type="button" data-scenario="crosswalk" aria-label="Pedestrian crossing challenge" title="Pedestrian crossing · 5.19" aria-pressed="false"><img src="static/images/signs/5.19.png" alt=""></button>
+            <button type="button" data-scenario="detour" aria-label="Detour challenge" title="Detour · 4.2.1" aria-pressed="false"><img src="static/images/signs/4.2.1.png" alt=""></button>
+            <button type="button" data-scenario="speed_limit" aria-label="Maximum speed challenge" title="Maximum speed · 3.24" aria-pressed="false"><img src="static/images/signs/3.24.png" alt=""></button>
+          </nav>
           <div class="simulator__stage">
-            <canvas id="sim-canvas" width="920" height="560" tabindex="0" aria-label="Interactive driving simulation. Use arrow keys to control the ego vehicle."></canvas>
-            <div class="simulator__hint"><span>Drive</span> ↑ throttle · ↓ brake / reverse · ← → steer</div>
+            <canvas id="sim-canvas" width="800" height="800" tabindex="0" aria-label="Live MetaDrive simulation. Use arrow keys to control the ego vehicle and obey the selected traffic sign."></canvas>
+            <div class="simulator__hint"><span>Follow the green route</span> ↑ throttle · ↓ brake / reverse · ← → steer</div>
             <div class="simulator__start" id="sim-start">
-              <strong>Take control</strong>
-              <span>Click here or press an arrow key to drive</span>
+              <strong>Start simulation</strong>
+              <span id="sim-start-copy">Yield to priority traffic, then follow the green route</span>
+            </div>
+            <div class="simulator__outcome" id="sim-outcome" hidden>
+              <span class="simulator__outcome-kicker" id="outcome-kicker">Game over</span>
+              <strong id="outcome-title">Rule violation</strong>
+              <p id="outcome-reason">The executable checker detected a traffic-rule violation.</p>
+              <button type="button" id="outcome-restart">Try again ↻</button>
             </div>
           </div>
           <aside class="simulator__panel">
             <div class="rule-card">
-              <div class="rule-card__sign"><img src="static/images/signs/2.5.png" alt="Stop sign"></div>
+              <div class="rule-card__sign"><img id="active-sign-image" src="static/images/signs/2.4.png" alt="Yield sign"></div>
               <div>
                 <span>Active rule</span>
-                <h3>Stop sign</h3>
-                <p>Come to a complete stop before the line, then yield to main-road traffic.</p>
+                <h3 id="active-sign-title">Yield · 2.4</h3>
+                <p id="active-sign-rule">Give priority to vehicles on the priority road. Stop only when traffic makes it necessary.</p>
               </div>
             </div>
             <div class="verifier" data-state="ready">
               <div class="verifier__pulse"></div>
               <div>
-                <span>Live checker · <b id="sim-speed">0.0</b> m/s</span>
-                <strong id="verifier-status">Approach the stop line</strong>
+                <span>Benchmark checker · <b id="sim-speed">0.0</b> m/s</span>
+                <strong id="verifier-status">Start MetaDrive to run the checker</strong>
               </div>
             </div>
             <div class="simulator__telemetry" aria-label="Simulation telemetry">
-              <div><span>Distance to line</span><strong id="line-distance">—</strong></div>
-              <div><span>Full stop</span><strong id="stop-state">Not yet</strong></div>
+              <div><span>Rule boundary</span><strong id="line-distance">—</strong></div>
+              <div><span>Challenge</span><strong id="stop-state">Not started</strong></div>
             </div>
             <div class="controls" aria-label="Vehicle controls">
               <button type="button" data-control="left" aria-label="Steer left">←<span>steer</span></button>
@@ -168,7 +183,7 @@
               <button class="controls__brake" type="button" data-control="down" aria-label="Brake or reverse">↓<span>brake / reverse</span></button>
             </div>
             <button class="reset-button" id="reset-scene" type="button">Restart scenario <span aria-hidden="true">↻</span></button>
-            <p class="simulator__help">The checker uses the benchmark threshold: speed below 0.5 m/s before crossing the stop line.</p>
+            <p class="simulator__help">Physics, Moscow map geometry, sign placement, and rule checks all run in TrafficSignBench on the server.</p>
           </aside>
         </div>
         <p class="sr-only" id="sim-live" aria-live="polite"></p>

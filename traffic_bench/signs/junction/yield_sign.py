@@ -1161,40 +1161,68 @@ class StopSign(YieldSign):
 
     def _track_stop_before_line(self, vehicle) -> bool:
         """Return True once the vehicle has made a complete stop before the line."""
+        vid = vehicle.id
+        state = self._vehicle_states_stop.setdefault(
+            vid,
+            {
+                "stopped_before_line": False,
+                "approached_stop_line": False,
+            },
+        )
         if not self._is_on_sign_road(vehicle):
-            return False
+            # Keep the approach state across the SUMO incoming-lane -> junction-
+            # lane transition. The old implementation dropped it exactly when
+            # the vehicle crossed a stop line placed at the incoming lane end.
+            return bool(state["stopped_before_line"])
         try:
             veh_long = self.lane.local_coordinates(vehicle.position)[0]
         except Exception:
             return False
 
-        vid = vehicle.id
         in_zone = self.zone_start <= veh_long <= self.zone_end
         if not in_zone:
-            self._vehicle_states_stop.pop(vid, None)
-            return False
+            if veh_long < self.zone_start:
+                state["stopped_before_line"] = False
+                state["approached_stop_line"] = False
+            return bool(state["stopped_before_line"])
 
-        state = self._vehicle_states_stop.setdefault(vid, {"stopped_before_line": False})
+        state["approached_stop_line"] = True
         stop_long = self.stop_line_position
         speed = float(getattr(vehicle, "speed", 0.0) or 0.0)
-        if veh_long < stop_long and speed < self.STOP_SPEED_THRESHOLD_MPS:
+        half_length = 0.5 * float(getattr(vehicle, "LENGTH", 0.0) or 0.0)
+        front_long = float(veh_long) + half_length
+        if (
+            front_long < stop_long
+            and speed < self.STOP_SPEED_THRESHOLD_MPS
+        ):
             state["stopped_before_line"] = True
         return bool(state["stopped_before_line"])
 
     def _is_stop_line_violating(self, vehicle) -> bool:
         """True if the vehicle crossed the stop line without stopping first."""
+        state = self._vehicle_states_stop.setdefault(
+            vehicle.id,
+            {
+                "stopped_before_line": False,
+                "approached_stop_line": False,
+            },
+        )
         if not self._is_on_sign_road(vehicle):
-            return False
+            return bool(
+                state.get("approached_stop_line", False)
+                and not state.get("stopped_before_line", False)
+            )
         try:
             veh_long = self.lane.local_coordinates(vehicle.position)[0]
         except Exception:
             return False
 
-        if veh_long < self.stop_line_position + self.STOP_LINE_PAST_MARGIN:
-            self._track_stop_before_line(vehicle)
+        stopped = self._track_stop_before_line(vehicle)
+        half_length = 0.5 * float(getattr(vehicle, "LENGTH", 0.0) or 0.0)
+        front_long = float(veh_long) + half_length
+        if front_long < self.stop_line_position + self.STOP_LINE_PAST_MARGIN:
             return False
 
-        stopped = self._track_stop_before_line(vehicle)
         return not stopped
 
     def _is_violating(self, vehicle) -> bool:

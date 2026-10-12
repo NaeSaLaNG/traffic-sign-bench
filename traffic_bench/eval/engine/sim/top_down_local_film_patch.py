@@ -42,7 +42,7 @@ def apply_top_down_local_film_patch() -> None:
             return _orig(map, *args, **kwargs)
         orig_bb = network.get_bounding_box
         cx, cy = _CENTER
-        half = max(40.0, _HALF_M)
+        half = max(12.0, _HALF_M)
 
         def _local_bb(*_a, **_k):
             return (cx - half, cx + half, cy - half, cy + half)
