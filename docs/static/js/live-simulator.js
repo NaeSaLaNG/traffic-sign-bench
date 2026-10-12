@@ -61,11 +61,39 @@
   let renderingFrame = false;
   let queuedFrame = null;
 
-  function websocketUrl() {
-    const configured =
+  function resolveDemoBackendBase() {
+    // Priority: ?ws=… → localStorage → <meta> → data-ws-url → same-origin.
+    // GitHub Pages cannot host MetaDrive; pass a public wss:// tunnel, e.g.
+    // https://emb-ai.github.io/traffic-sign-bench/?ws=wss://….trycloudflare.com/api/drive
+    const params = new URLSearchParams(location.search);
+    const fromQuery = params.get("ws")?.trim();
+    if (fromQuery) {
+      try {
+        localStorage.setItem("traffic-bench-demo-ws", fromQuery);
+      } catch (_) {
+        /* ignore quota / private mode */
+      }
+      return fromQuery;
+    }
+    try {
+      const stored = localStorage.getItem("traffic-bench-demo-ws")?.trim();
+      if (stored) return stored;
+    } catch (_) {
+      /* ignore */
+    }
+    return (
       document.querySelector('meta[name="traffic-bench-demo-ws"]')?.content.trim() ||
-      section?.dataset.wsUrl?.trim();
+      section?.dataset.wsUrl?.trim() ||
+      ""
+    );
+  }
+
+  function websocketUrl() {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    let configured = resolveDemoBackendBase();
+    if (configured && !/\/api\/drive\/?$/i.test(configured.replace(/\/$/, ""))) {
+      configured = configured.replace(/\/$/, "") + "/api/drive";
+    }
     const base = configured || `${protocol}//${location.host}/api/drive`;
     const url = new URL(base, location.href);
     if (url.protocol === "http:") url.protocol = "ws:";

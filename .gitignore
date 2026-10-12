@@ -16,6 +16,9 @@ dist/
 .idea/
 *.Zone.Identifier
 
+### Local tool binaries (cloudflared, etc.)
+.tools/
+
 ### Logs / PIDs / local backups
 *.log
 *.pid

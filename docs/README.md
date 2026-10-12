@@ -43,27 +43,45 @@ python -m traffic_bench.demo.server --smoke-test
 The old browser-only toy remains in `static/js/simulator.js` for reference but
 is no longer loaded.
 
-## Public deployment
+## Public deployment (GitHub Pages + live demo)
 
-GitHub Pages cannot run Python. Keep the site there, run
-`tools/run_live_demo.sh` on a compute node, and expose `/api/drive` through an
-HTTPS reverse proxy that supports WebSocket upgrades. Then set this tag in
-`index.html`:
+GitHub Pages cannot run Python. Keep the static site there and expose the
+MetaDrive backend with an HTTPS WebSocket tunnel.
+
+### One-command Quick Tunnel
+
+```bash
+conda activate trafficsignbench   # or zinkovich-plant2
+bash tools/run_live_demo_public.sh
+```
+
+The script starts the demo server and a Cloudflare Quick Tunnel, then prints:
+
+- the public `https://….trycloudflare.com` URL (serves the docs + `/api/drive`)
+- a GitHub Pages link with `?ws=wss://…/api/drive` so the published site talks
+  to your running backend
+
+Open either link. The `?ws=` value is remembered in `localStorage` for later
+visits to the Pages site until the tunnel URL changes.
+
+### Stable reverse proxy
+
+For a fixed hostname, terminate TLS yourself and set:
 
 ```html
 <meta name="traffic-bench-demo-ws"
       content="wss://demo.example.org/api/drive">
 ```
 
-Allow that site origin on the server:
+The server already allows `https://emb-ai.github.io`. Extra origins:
 
 ```bash
 bash tools/run_live_demo.sh \
   --allowed-origin https://emb-ai.github.io
 ```
 
-The backend is deliberately single-session and has no authentication. Put
-rate limiting and TLS at the reverse proxy before exposing it publicly.
+The backend is deliberately single-session and has no authentication. Prefer a
+named Cloudflare Tunnel or your own reverse proxy for anything beyond demos.
 
 ## Rebuild media
 
@@ -78,5 +96,4 @@ progressive playback, and exports the poster.
 ## GitHub Pages
 
 Configure **Settings → Pages → Deploy from a branch**, using `main` and
-`/docs`. The committed `.nojekyll` file keeps the static paths unchanged. The
-live section also needs the public `wss://` backend URL described above.
+`/docs` as the publishing source (or sync `docs/` into `gh-pages`).
