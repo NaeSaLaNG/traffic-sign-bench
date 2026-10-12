@@ -7,5 +7,11 @@ name = "traffic-bench"
 version = "0.1.0"
 requires-python = ">=3.8"
 
+[project.optional-dependencies]
+demo = [
+  "aiohttp>=3.9,<4",
+  "Pillow>=9",
+]
+
 [tool.setuptools.packages.find]
 include = ["traffic_bench*"]

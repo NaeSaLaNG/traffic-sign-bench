@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Turn right">
+  <circle cx="50" cy="50" r="48" fill="#1769d2"/>
+  <path d="M29 67c1-21 11-32 29-35V20l22 20-22 20V47C48 49 43 56 42 69z" fill="#fff"/>
+</svg>
