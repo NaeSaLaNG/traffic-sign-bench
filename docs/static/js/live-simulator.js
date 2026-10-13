@@ -314,6 +314,12 @@
       if (data.type === "telemetry") {
         updateTelemetry(data);
       } else if (data.type === "ready") {
+        if (Number.isFinite(data.active_sessions) && Number.isFinite(data.max_sessions)) {
+          setConnection(
+            `Live MetaDrive · ${data.active_sessions}/${data.max_sessions} sessions`,
+            "live",
+          );
+        }
         // Only enforce when the backend actually reports a scenario id.
         // Older single-scene servers omit it; closing then looked like a disconnect.
         if (data.scenario_id && data.scenario_id !== currentScenario) {
@@ -326,10 +332,20 @@
           showOverlay("Wrong backend scenario", "Restart tools/run_live_demo.sh, then click again");
         }
       } else if (data.type === "error") {
+        activeSocket.demoServerError = true;
         status.textContent = data.message;
         verifier.dataset.state = "violation";
-        setConnection("Simulator error", "offline");
-        showOverlay("Could not start scene", data.message || "Click to retry");
+        const atCapacity = data.code === "capacity";
+        const timedOut = data.code === "idle_timeout";
+        setConnection(atCapacity ? "All demo slots are busy" : "Simulator error", "offline");
+        showOverlay(
+          atCapacity
+            ? "Demo at capacity"
+            : timedOut
+              ? "Session time reached"
+              : "Could not start scene",
+          data.message || "Click to retry",
+        );
       }
     });
 
@@ -338,6 +354,7 @@
       connecting = false;
       releaseControls();
       socket = null;
+      if (activeSocket.demoServerError) return;
       setConnection("Simulator offline", "offline");
       showOverlay("MetaDrive disconnected", "Click to reconnect");
     });

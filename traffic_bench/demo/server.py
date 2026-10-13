@@ -1,16 +1,18 @@
 """Serve a gallery of real MetaDrive traffic-sign scenarios to a browser.
 
-The MVP intentionally supports one active driver at a time. MetaDrive owns
-process-global Panda3D state, so a production multi-user service should run one
-simulator worker process per session instead of creating concurrent envs here.
+MetaDrive owns process-global Panda3D state. Each browser session therefore
+runs in its own spawned worker process while this module's aiohttp server acts
+as the lightweight WebSocket gateway.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import io
 import json
+import multiprocessing as mp
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -810,6 +812,94 @@ class DemoSession:
         return output.getvalue()
 
 
+def run_session_worker(
+    connection: Any,
+    scenario: ScenarioSpec,
+    row: dict[str, Any],
+    scenes_root: Path,
+    frame_interval: float,
+    idle_timeout: float,
+) -> None:
+    """Run one MetaDrive engine in an isolated process."""
+    session: DemoSession | None = None
+    try:
+        session = DemoSession(scenario, row, scenes_root)
+        connection.send(
+            (
+                "json",
+                {
+                    "type": "ready",
+                    "scenario_id": scenario.id,
+                    "scenario_title": scenario.title,
+                    "scene": row.get("scene_id"),
+                    "sign": row.get("pdd_code"),
+                },
+            )
+        )
+        last_activity_at = time.monotonic()
+        next_frame = last_activity_at
+
+        while True:
+            while connection.poll():
+                command = connection.recv()
+                command_type = command.get("type")
+                if command_type == "close":
+                    return
+                if command_type == "control":
+                    session.set_controls(command)
+                    last_activity_at = time.monotonic()
+                elif command_type == "restart":
+                    session.reset()
+                    last_activity_at = time.monotonic()
+                    next_frame = last_activity_at
+
+            if idle_timeout > 0 and time.monotonic() - last_activity_at >= idle_timeout:
+                connection.send(
+                    (
+                        "json",
+                        {
+                            "type": "error",
+                            "code": "idle_timeout",
+                            "message": (
+                                "The demo session was inactive for too long. "
+                                "Reconnect to start a new session."
+                            ),
+                        },
+                    )
+                )
+                return
+
+            session.step()
+            connection.send(("json", session.telemetry()))
+            connection.send(("frame", session.render_jpeg()))
+
+            next_frame += frame_interval
+            delay = next_frame - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                # Do not accumulate lag when rendering takes longer than a frame.
+                next_frame = time.monotonic()
+    except (BrokenPipeError, ConnectionResetError, EOFError):
+        pass
+    except Exception as exc:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, EOFError):
+            connection.send(
+                (
+                    "json",
+                    {
+                        "type": "error",
+                        "code": "worker_error",
+                        "message": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            )
+    finally:
+        if session is not None:
+            session.close()
+        connection.close()
+
+
 class DemoServer:
     def __init__(
         self,
@@ -820,6 +910,8 @@ class DemoServer:
         fps: float,
         allowed_origins: set[str],
         allow_any_origin: bool,
+        max_sessions: int,
+        idle_timeout: float,
     ) -> None:
         self.scenarios = scenarios
         self.default_scenario = default_scenario
@@ -827,7 +919,10 @@ class DemoServer:
         self.frame_interval = 1.0 / fps
         self.allowed_origins = allowed_origins
         self.allow_any_origin = allow_any_origin
-        self.session_lock = asyncio.Lock()
+        self.max_sessions = max_sessions
+        self.idle_timeout = idle_timeout
+        self.active_sessions = 0
+        self.process_context = mp.get_context("spawn")
 
     def make_app(self) -> web.Application:
         app = web.Application()
@@ -845,7 +940,10 @@ class DemoServer:
                 "simulator": "MetaDrive",
                 "scenarios": sorted(self.scenarios),
                 "default_scenario": self.default_scenario,
-                "busy": self.session_lock.locked(),
+                "active_sessions": self.active_sessions,
+                "max_sessions": self.max_sessions,
+                "available_sessions": self.max_sessions - self.active_sessions,
+                "busy": self.active_sessions >= self.max_sessions,
             }
         )
 
@@ -875,102 +973,163 @@ class DemoServer:
     async def drive(self, request: web.Request) -> web.StreamResponse:
         if not self._origin_allowed(request):
             raise web.HTTPForbidden(text="WebSocket origin is not allowed")
-        if self.session_lock.locked():
+
+        scenario_id = (
+            request.match_info.get("scenario")
+            or request.query.get("scenario")
+            or self.default_scenario
+        )
+        selected = self.scenarios.get(scenario_id)
+        if selected is None:
             ws = web.WebSocketResponse()
             await ws.prepare(request)
             await ws.send_json(
-                {"type": "error", "message": "The demo is currently in use"}
+                {
+                    "type": "error",
+                    "code": "unknown_scenario",
+                    "message": f"Unknown scenario: {scenario_id}",
+                }
             )
-            await ws.close(code=1013, message=b"demo busy")
+            await ws.close(code=1008, message=b"unknown scenario")
             return ws
 
-        async with self.session_lock:
-            ws = web.WebSocketResponse(heartbeat=15, max_msg_size=16_384)
+        # No await between the check and increment: aiohttp runs both atomically
+        # on this event loop, so the hard capacity cannot be oversubscribed.
+        if self.active_sessions >= self.max_sessions:
+            ws = web.WebSocketResponse()
             await ws.prepare(request)
-            session: DemoSession | None = None
-            receiver: asyncio.Task | None = None
-            commands: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=8)
-            try:
-                scenario_id = (
-                    request.match_info.get("scenario")
-                    or request.query.get("scenario")
-                    or self.default_scenario
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "code": "capacity",
+                    "message": (
+                        f"All {self.max_sessions} demo sessions are currently in use. "
+                        "Please try again shortly."
+                    ),
+                }
+            )
+            await ws.close(code=1013, message=b"demo capacity reached")
+            return ws
+
+        self.active_sessions += 1
+        ws = web.WebSocketResponse(heartbeat=15, max_msg_size=16_384)
+        parent_connection = None
+        child_connection = None
+        process = None
+        receiver: asyncio.Task | None = None
+        worker_read: asyncio.Task | None = None
+        try:
+            await ws.prepare(request)
+            scenario, row, scenes_root = selected
+            parent_connection, child_connection = self.process_context.Pipe()
+            process = self.process_context.Process(
+                target=run_session_worker,
+                args=(
+                    child_connection,
+                    scenario,
+                    row,
+                    scenes_root,
+                    self.frame_interval,
+                    self.idle_timeout,
+                ),
+                name=f"traffic-demo-{scenario.id}",
+                daemon=True,
+            )
+            process.start()
+            child_connection.close()
+            child_connection = None
+
+            async def receive_commands() -> None:
+                async for message in ws:
+                    if message.type == WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(message.data)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            parent_connection.send(payload)
+                        except (BrokenPipeError, ConnectionResetError, EOFError, OSError):
+                            break
+                    elif message.type in (
+                        WSMsgType.CLOSE,
+                        WSMsgType.CLOSED,
+                        WSMsgType.ERROR,
+                    ):
+                        break
+
+            receiver = asyncio.create_task(receive_commands())
+            while not ws.closed and not receiver.done():
+                worker_read = asyncio.create_task(
+                    asyncio.to_thread(parent_connection.recv)
                 )
-                selected = self.scenarios.get(scenario_id)
-                if selected is None:
-                    await ws.send_json(
-                        {
-                            "type": "error",
-                            "message": f"Unknown scenario: {scenario_id}",
-                        }
-                    )
-                    await ws.close(code=1008, message=b"unknown scenario")
-                    return ws
-                scenario, row, scenes_root = selected
-                session = DemoSession(scenario, row, scenes_root)
+                done, _pending = await asyncio.wait(
+                    (worker_read, receiver),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receiver in done:
+                    worker_read.cancel()
+                    break
+
+                try:
+                    packet_type, payload = worker_read.result()
+                except (BrokenPipeError, ConnectionResetError, EOFError, OSError):
+                    if not ws.closed:
+                        await ws.send_json(
+                            {
+                                "type": "error",
+                                "code": "worker_stopped",
+                                "message": "The simulator worker stopped unexpectedly.",
+                            }
+                        )
+                    break
+                worker_read = None
+
+                if packet_type == "json":
+                    if payload.get("type") == "ready":
+                        payload["active_sessions"] = self.active_sessions
+                        payload["max_sessions"] = self.max_sessions
+                    await ws.send_json(payload)
+                elif packet_type == "frame":
+                    await ws.send_bytes(payload)
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            if not ws.closed:
                 await ws.send_json(
                     {
-                        "type": "ready",
-                        "scenario_id": scenario.id,
-                        "scenario_title": scenario.title,
-                        "scene": row.get("scene_id"),
-                        "sign": row.get("pdd_code"),
+                        "type": "error",
+                        "code": "gateway_error",
+                        "message": f"{type(exc).__name__}: {exc}",
                     }
                 )
-
-                async def receive_commands() -> None:
-                    async for message in ws:
-                        if message.type == WSMsgType.TEXT:
-                            try:
-                                payload = json.loads(message.data)
-                            except json.JSONDecodeError:
-                                continue
-                            if commands.full():
-                                try:
-                                    commands.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    pass
-                            commands.put_nowait(payload)
-                        elif message.type in (
-                            WSMsgType.CLOSE,
-                            WSMsgType.CLOSED,
-                            WSMsgType.ERROR,
-                        ):
-                            break
-
-                receiver = asyncio.create_task(receive_commands())
-                next_frame = time.monotonic()
-                while not ws.closed and not receiver.done():
-                    while not commands.empty():
-                        command = commands.get_nowait()
-                        if command.get("type") == "control":
-                            session.set_controls(command)
-                        elif command.get("type") == "restart":
-                            session.reset()
-
-                    session.step()
-                    await ws.send_json(session.telemetry())
-                    await ws.send_bytes(session.render_jpeg())
-                    next_frame += self.frame_interval
-                    await asyncio.sleep(max(0.0, next_frame - time.monotonic()))
-            except (ConnectionResetError, asyncio.CancelledError):
-                pass
-            except Exception as exc:
-                if not ws.closed:
-                    await ws.send_json(
-                        {
-                            "type": "error",
-                            "message": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
-            finally:
-                if receiver is not None:
-                    receiver.cancel()
-                if session is not None:
-                    session.close()
-                if not ws.closed:
-                    await ws.close()
-            return ws
+        finally:
+            if receiver is not None:
+                receiver.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receiver
+            if worker_read is not None:
+                worker_read.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker_read
+            if parent_connection is not None:
+                with contextlib.suppress(
+                    BrokenPipeError, ConnectionResetError, EOFError, OSError
+                ):
+                    parent_connection.send({"type": "close"})
+            if process is not None:
+                await asyncio.to_thread(process.join, 2.0)
+                if process.is_alive():
+                    process.terminate()
+                    await asyncio.to_thread(process.join, 2.0)
+                process.close()
+            if parent_connection is not None:
+                parent_connection.close()
+            if child_connection is not None:
+                child_connection.close()
+            self.active_sessions -= 1
+            if not ws.closed:
+                await ws.close()
+        return ws
 
 
 def parse_args() -> argparse.Namespace:
@@ -980,6 +1139,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=8,
+        help="Maximum number of concurrent isolated simulator processes.",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=120.0,
+        help="Close sessions with no control input after this many seconds; 0 disables.",
+    )
     parser.add_argument("--scene-index", type=int, default=0)
     parser.add_argument(
         "--default-scenario",
@@ -1006,6 +1177,10 @@ def main() -> None:
     args = parse_args()
     if not (1.0 <= args.fps <= 20.0):
         raise SystemExit("--fps must be between 1 and 20")
+    if not (1 <= args.max_sessions <= 64):
+        raise SystemExit("--max-sessions must be between 1 and 64")
+    if args.idle_timeout < 0:
+        raise SystemExit("--idle-timeout must be non-negative")
     scenarios = {
         scenario.id: (
             scenario,
@@ -1050,6 +1225,8 @@ def main() -> None:
         fps=args.fps,
         allowed_origins=DEFAULT_ORIGINS | set(args.allowed_origin),
         allow_any_origin=args.allow_any_origin,
+        max_sessions=args.max_sessions,
+        idle_timeout=args.idle_timeout,
     )
     web.run_app(server.make_app(), host=args.host, port=args.port)
 
