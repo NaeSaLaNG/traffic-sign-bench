@@ -8,7 +8,7 @@
   <img src="assets/signs/main_road.png" alt="" height="36"/>
   <img src="assets/signs/stop.png" alt="" height="36"/>
   <img src="assets/signs/roundabout.png" alt="" height="36"/>
-  &nbsp;TrafficSignBench&nbsp;
+   TrafficSignBench 
   <img src="assets/signs/speed_limit.png" alt="" height="36"/>
   <img src="assets/signs/no_entry.png" alt="" height="36"/>
   <img src="assets/signs/direction_right.png" alt="" height="36"/>
@@ -27,6 +27,7 @@ Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Dri
 
 ## <img src="assets/signs/detour_right.png" alt="" height="23"/> News
 
+- - **[2026-10-13]** Project page is out! Try the interactive demo [emb-ai.github.io/traffic-sign-bench](https://emb-ai.github.io/traffic-sign-bench/)
 - **[2026-09-29]** Our paper is now available on [arXiv](https://arxiv.org/abs/2609.38463)! Check out the [video demo](https://emb-ai.github.io/traffic-sign-bench/).
 - **[2026-09-28]** TrafficSignBench code is out! Run the Quick start test below, or evaluate your own planner on the [released scenes](https://huggingface.co/datasets/emb-ai/traffic-sign-bench) and [checkpoints](https://huggingface.co/emb-ai/traffic-rule-bench-models).
 
@@ -53,7 +54,7 @@ Rule-supervised fine-tuning raises PlanT-2 from **5.9% to 72.3%** without replac
 <p align="center">
   <img src="assets/rollouts/plant2/direction_s_l/plant2.gif" alt="PlanT-2 direction baseline" width="23%"/>
   <img src="assets/rollouts/plant2/direction_s_l/plant2_ft_n2e8.gif" alt="PlanT-2-FT direction" width="23%"/>
-  &nbsp;&nbsp;&nbsp;&nbsp;
+      
   <img src="assets/rollouts/plant2/speed/plant2.gif" alt="PlanT-2 speed baseline" width="23%"/>
   <img src="assets/rollouts/plant2/speed/plant2_ft.gif" alt="PlanT-2-FT speed" width="23%"/><br/>
   <em>
