@@ -14,15 +14,26 @@ pip install -e ".[demo]"
 bash tools/run_live_demo.sh
 ```
 
-Then open <http://localhost:8765>. The server hosts the static site and one
+Then open <http://localhost:8765>. The server hosts the static site and a
 real MetaDrive session selected from four traffic-sign challenges (yield,
 crosswalk, detour, maximum speed). Arrow-key state is sent over a WebSocket;
 the server steps the benchmark environment, runs the matching executable
 checker, and returns 10 FPS square top-down JPEG frames plus live telemetry.
 
-Only one driver is accepted at a time. This is intentional for the MVP because
-MetaDrive/Panda3D has process-global state. A multi-user deployment should use
-one worker process per session.
+Up to eight drivers are accepted at a time. MetaDrive/Panda3D has process-global
+state, so the WebSocket gateway starts each active simulator in an isolated
+spawned process. A connection with no control input is closed after two minutes
+so abandoned browser tabs cannot hold a slot forever. Both limits are configurable:
+
+```bash
+TRAFFIC_BENCH_DEMO_MAX_SESSIONS=8 \
+TRAFFIC_BENCH_DEMO_IDLE_TIMEOUT=120 \
+bash tools/run_live_demo.sh
+```
+
+The first frame takes a few seconds while that session's environment starts.
+`GET /api/health` reports `active_sessions`, `available_sessions`, and
+`max_sessions`.
 
 Run a simulator/rendering smoke test without opening a port:
 
@@ -80,8 +91,9 @@ bash tools/run_live_demo.sh \
   --allowed-origin https://emb-ai.github.io
 ```
 
-The backend is deliberately single-session and has no authentication. Prefer a
-named Cloudflare Tunnel or your own reverse proxy for anything beyond demos.
+The backend has no authentication. It only accepts the published project origin
+and same-origin clients by default; prefer a named Cloudflare Tunnel or your own
+reverse proxy for anything beyond demos.
 
 ## Rebuild media
 

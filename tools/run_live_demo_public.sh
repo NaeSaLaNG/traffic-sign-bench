@@ -73,8 +73,9 @@ echo "[public-demo] starting MetaDrive backend on 0.0.0.0:${PORT}"
 python -m traffic_bench.demo.server \
   --host 0.0.0.0 \
   --port "$PORT" \
+  --max-sessions "${TRAFFIC_BENCH_DEMO_MAX_SESSIONS:-8}" \
+  --idle-timeout "${TRAFFIC_BENCH_DEMO_IDLE_TIMEOUT:-120}" \
   --allowed-origin https://emb-ai.github.io \
-  --allow-any-origin \
   "${EXTRA_ARGS[@]}" \
   >"$DEMO_LOG" 2>&1 &
 DEMO_PID=$!
