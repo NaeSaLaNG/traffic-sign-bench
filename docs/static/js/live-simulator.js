@@ -286,9 +286,13 @@
       socket.binaryType = "blob";
     } catch (error) {
       connecting = false;
-      setConnection("Backend unavailable", "offline");
-      showOverlay("Could not connect", "Click to retry");
-      status.textContent = error.message;
+      setConnection("Demo unavailable", "offline");
+      showOverlay(
+        "Sorry, the live demo is unavailable",
+        "We are trying to fix it. Please try again later.",
+      );
+      status.textContent =
+        "Sorry, the live demo is unavailable. We are trying to fix it.";
       return;
     }
 
@@ -329,7 +333,10 @@
           activeSocket.demoIntentionalClose = true;
           activeSocket.close(1008, "scenario mismatch");
           setConnection("Scenario mismatch", "offline");
-          showOverlay("Wrong backend scenario", "Restart tools/run_live_demo.sh, then click again");
+          showOverlay(
+            "Sorry, the live demo is unavailable",
+            "We are trying to fix it. Please try again later.",
+          );
         }
       } else if (data.type === "error") {
         activeSocket.demoServerError = true;
@@ -355,15 +362,23 @@
       releaseControls();
       socket = null;
       if (activeSocket.demoServerError) return;
-      setConnection("Simulator offline", "offline");
-      showOverlay("MetaDrive disconnected", "Click to reconnect");
+      setConnection("Demo unavailable", "offline");
+      showOverlay(
+        "Sorry, the live demo is unavailable",
+        "We are trying to fix it. Please try again later.",
+      );
     });
 
     activeSocket.addEventListener("error", () => {
       if (socket !== activeSocket || activeSocket.demoIntentionalClose) return;
       status.textContent =
-        "Cannot reach the MetaDrive backend. Is tools/run_live_demo.sh running?";
+        "Sorry, the live demo is unavailable. We are trying to fix it.";
       verifier.dataset.state = "violation";
+      setConnection("Demo unavailable", "offline");
+      showOverlay(
+        "Sorry, the live demo is unavailable",
+        "We are trying to fix it. Please try again later.",
+      );
     });
   }
 

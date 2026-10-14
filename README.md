@@ -27,7 +27,7 @@ Rule-Centric Closed-Loop Evaluation of Traffic-Sign Compliance in Autonomous Dri
 
 ## <img src="assets/signs/detour_right.png" alt="" height="23"/> News
 
-- **[2026-10-13]** Project page is out! Try the interactive demo [emb-ai.github.io/traffic-sign-bench](https://emb-ai.github.io/traffic-sign-bench/).
+- **[2026-10-13]** Project page is out! Try the [interactive demo](https://emb-ai.github.io/traffic-sign-bench/).
 - **[2026-09-29]** Our paper is now available on [arXiv](https://arxiv.org/abs/2609.38463)! Check out the [video demo](https://emb-ai.github.io/traffic-sign-bench/).
 - **[2026-09-28]** TrafficSignBench code is out! Run the Quick start test below, or evaluate your own planner on the [released scenes](https://huggingface.co/datasets/emb-ai/traffic-sign-bench) and [checkpoints](https://huggingface.co/emb-ai/traffic-rule-bench-models).
 
