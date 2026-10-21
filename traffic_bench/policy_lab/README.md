@@ -74,19 +74,25 @@ How this holds:
 4. Serve the model with tool calling. For Qwen-style chat templates:
 
    ```bash
-   vllm serve Qwen/Qwen2.5-Coder-32B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
+   vllm serve checkpoints/Qwen/Qwen3.8-27B-FP8 \
+  --served-model-name Qwen3.8-27B-FP8 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
    ```
 
 5. Run the agent with a **dev** manifest. Keep a disjoint **test** manifest for
    the final score; the agent never sees it.
 
    ```bash
+   python -m traffic_bench.eval manifest sign=crosswalk paths.split=train
    python -m traffic_bench.policy_lab.agent \
-       --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/r1 \
-       --image /scratch/policy_lab/policy.sif \
-       --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-       --dev-manifest <dev manifest.jsonl> --episodes-per-eval 60 --max-evals 20 \
-       --llm-url http://<vllm host>:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
+      --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/crosswalk \
+      --image /scratch/policy_lab/policy.sif \
+      --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
+      --gpu --device cuda \
+      --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
+      --episodes-per-eval 60 --max-evals 20 \
+      --llm-url http://<vllm host>:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
    ```
 
    `runs/r1/` gets `transcript.jsonl`, one `eval_NNN/` per evaluation (sandbox
