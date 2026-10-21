@@ -167,6 +167,60 @@ and `final/sandbox` (the champion's evaluation snapshot), which you score with
 step 6 as before. `--critic-url`/`--critic-model` point the critic at another
 server or model.
 
+### One sign at a time
+
+To search for the best policy for a single sign, give each sign its own
+manifests, sandbox and run dir. The builder writes into the sandbox, so two
+signs sharing one would overwrite each other's `policies/rNN_*.py`. One vLLM
+server can serve all signs.
+
+1. Build the manifests: train for the search, test for the final score. The
+   agent never sees test.
+
+   ```bash
+   SIGN=crosswalk
+   python -m traffic_bench.eval manifest sign=$SIGN paths.split=train
+   python -m traffic_bench.eval manifest sign=$SIGN paths.split=test
+   ```
+
+2. Export a sandbox for this sign:
+
+   ```bash
+   python -m traffic_bench.policy_lab.export_sandbox --out /scratch/policy_lab/sandbox_$SIGN
+   ```
+
+3. Run the gauntlet on the train manifest:
+
+   ```bash
+   python -m traffic_bench.policy_lab.gauntlet \
+      --sandbox /scratch/policy_lab/sandbox_$SIGN --run-dir /scratch/policy_lab/runs/$SIGN \
+      --image /scratch/policy_lab/policy.sif \
+      --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
+      --gpu --device cuda \
+      --dev-manifest data/runs/$SIGN/train/real_manifest.jsonl \
+      --episodes-per-eval 60 --max-evals 20 --min-delta 0.04 \
+      --llm-url http://<vllm host>:8000/v1 --model Qwen3.8-27B-FP8
+   ```
+
+   Progress is in `/scratch/policy_lab/runs/$SIGN/progress.md`.
+
+4. Score the champion on the test manifest:
+
+   ```bash
+   POLICY=$(python -c "import json;print(json.load(open('/scratch/policy_lab/runs/$SIGN/final.json'))['submitted']['policy_path'])")
+   python -m traffic_bench.policy_lab.judge --sandbox /scratch/policy_lab/runs/$SIGN/final/sandbox \
+      --policy $POLICY --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
+      --image /scratch/policy_lab/policy.sif --gpu --device cuda \
+      --manifest data/runs/$SIGN/test/real_manifest.jsonl \
+      --private-dir /scratch/policy_lab/runs/$SIGN/test --out /scratch/policy_lab/runs/$SIGN/test/feedback.json
+   ```
+
+Every evaluation uses the same dev episodes. If the train manifest has fewer
+rows than `--episodes-per-eval`, all of them are used. With 60 episodes, one
+episode is about 0.017 of `clean_success_rate`, so for a single sign keep
+`--min-delta` at 0.03–0.05 so that noise does not change the champion. Signs
+can run in parallel as long as each has its own sandbox and run dir.
+
 ## Notes and limits
 
 * If `--network none` is not allowed for unprivileged users on the cluster,
