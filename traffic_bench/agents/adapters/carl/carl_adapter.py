@@ -618,8 +618,12 @@ class CaRLMetaDriveAdapter:
         import torch
         import gymnasium as gym
 
-        from traffic_bench.eval.sign_registry import repo_root
-        CARL_PATH = str(repo_root() / "third_party" / "CaRL" / "nuPlan")
+        # CARL_NUPLAN_PATH lets the policy-lab sandbox load the network
+        # without the benchmark package next to it.
+        CARL_PATH = os.environ.get("CARL_NUPLAN_PATH")
+        if not CARL_PATH:
+            from traffic_bench.eval.sign_registry import repo_root
+            CARL_PATH = str(repo_root() / "third_party" / "CaRL" / "nuPlan")
 
         if CARL_PATH not in sys.path:
             sys.path.insert(0, CARL_PATH)

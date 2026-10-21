@@ -1,0 +1,18 @@
+# Image for the sandboxed policy process and the agent's `run` tool.
+#   apptainer build policy.sif traffic_bench/policy_lab/apptainer/policy.def
+# Contains no benchmark code; the sandbox is bind-mounted at /work at run time.
+# Add whatever else carl_nuplan's PPO model imports if `check_policy.py` fails
+# on a missing module.
+Bootstrap: docker
+From: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+%post
+    pip install --no-cache-dir \
+        "numpy<2" \
+        gymnasium==0.29.1 \
+        opencv-python-headless==4.10.0.84 \
+        scipy
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONNOUSERSITE=1

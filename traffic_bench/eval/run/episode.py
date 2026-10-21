@@ -353,7 +353,7 @@ def run_one_episode(
         policy_cls = RuleCompliantExpertPolicy
     elif policy_type == "ppo_lidar":
         policy_cls = ExpertPolicy
-    elif policy_type in ("carl", "carl_rule") or policy_type in PLANT2_POLICIES:
+    elif policy_type in ("carl", "carl_rule", "remote_carl") or policy_type in PLANT2_POLICIES:
         policy_cls = models.get("policy_cls")
         if policy_cls is None:
             raise RuntimeError(f"policy_cls for --policy {policy_type} not loaded; "
