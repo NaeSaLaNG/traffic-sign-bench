@@ -103,3 +103,4 @@ reports/gifval*/
 # The stills and clips README.md uses were exported from it into assets/;
 # see assets/README.md for the exact sources.
 video/
+/checkpoints
