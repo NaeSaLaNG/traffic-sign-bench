@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -112,15 +113,18 @@ class LLMClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def chat(self, messages: list[dict], tools: list[dict]) -> dict:
-        body = json.dumps({
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             temperature: float | None = None) -> dict:
+        payload = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": self.temperature,
+            "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens,
-        }).encode("utf-8")
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -220,9 +224,12 @@ class SandboxTools:
             return _clip(f"[timeout after {timeout_s}s]\n{_drop_apptainer_noise(out)}")
         return _clip(f"exit code {proc.returncode}\n{_drop_apptainer_noise(proc.stdout + proc.stderr)}")
 
-    def evaluate(self, policy_path: str) -> str:
-        if self.evals_used >= self.evalcfg.max_evals:
-            return "evaluation budget exhausted; submit your best policy"
+    def run_judge(self, policy_path: str) -> tuple[Path, dict | None, str | None]:
+        """Run the judge on a snapshot of the sandbox, spending one evaluation.
+
+        Returns (eval_dir, feedback, error); feedback is None when the judge
+        failed, and then ``error`` is the message to show the model.
+        """
         policy_file = self._resolve(policy_path)
         rel = str(policy_file.relative_to(self.root))
         self.evals_used += 1
@@ -257,16 +264,29 @@ class SandboxTools:
             self.judge_failures += 1
             if self.judge_failures >= 3:
                 self.evals_used = self.evalcfg.max_evals
-                return "the simulator keeps failing; evaluation is unavailable, submit your best policy"
-            return "evaluation failed on the simulator side (not counted against your budget); retry later"
+                return eval_dir, None, ("the simulator keeps failing; evaluation is unavailable, "
+                                        "submit your best policy")
+            return eval_dir, None, ("evaluation failed on the simulator side "
+                                    "(not counted against your budget); retry later")
         feedback = json.loads(feedback_path.read_text())
         self.history.append({"eval": self.evals_used, "dir": eval_dir.name, "policy": rel,
                              "overall": feedback.get("overall")})
+        return eval_dir, feedback, None
+
+    def policy_log_tail(self, eval_dir: Path, lines: int = 40) -> str:
         policy_log = eval_dir / "judge" / "policy.log"
-        tail = ""
-        if policy_log.is_file():
-            lines = _drop_apptainer_noise(policy_log.read_text(errors="replace")).splitlines()
-            tail = "\n".join(lines[-40:])
+        if not policy_log.is_file():
+            return ""
+        return "\n".join(_drop_apptainer_noise(policy_log.read_text(errors="replace")).splitlines()[-lines:])
+
+    def evaluate(self, policy_path: str) -> str:
+        if self.evals_used >= self.evalcfg.max_evals:
+            return "evaluation budget exhausted; submit your best policy"
+        rel = str(self._resolve(policy_path).relative_to(self.root))
+        eval_dir, feedback, error = self.run_judge(rel)
+        if feedback is None:
+            return error
+        tail = self.policy_log_tail(eval_dir)
         left = self.evalcfg.max_evals - self.evals_used
         return _clip(
             f"evaluation #{self.evals_used} of {rel} ({left} left)\n"
@@ -295,6 +315,14 @@ class SandboxTools:
 def _drop_apptainer_noise(text: str) -> str:
     """Apptainer's own INFO/WARNING lines name host paths; drop them."""
     return "\n".join(l for l in text.splitlines() if not l.startswith(("INFO:", "WARNING:", "FATAL:")))
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop Qwen3-style ``<think>...</think>`` blocks (vLLM without --reasoning-parser)."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    if "</think>" in text:  # opening tag eaten by the chat template
+        text = text.split("</think>", 1)[1]
+    return text.strip()
 
 
 def _shrink_history(messages: list[dict], budget_chars: int) -> None:

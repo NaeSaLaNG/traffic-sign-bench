@@ -111,6 +111,62 @@ How this holds:
    `--launcher local` runs the policy without a container. It is for
    debugging only and gives no isolation.
 
+## Gauntlet loop
+
+`gauntlet.py` is an alternative to step 5 that splits the work between a
+builder, an orchestrator and a critic, so the model that writes a policy never
+grades it:
+
+```
+ champion (starts as policies/carl_baseline.py, evaluated once)
+    │
+    ▼  each round
+ builder  (fresh conversation; list/read/write/run + propose, no evaluate)
+    │  brief: TASK.md, champion + its metrics, critic's biggest gap, past rounds
+    ▼  propose(policies/rNN_*.py)
+ orchestrator: check_policy.py in the container ─ fail → back to builder
+    │  judge on the same dev episodes (one evaluation)
+    ▼
+ critic  (fresh, no tools): TASK.md + policies A/B in random order,
+    │     source + aggregate metrics, not told which is the champion
+    │  → {"winner", "reason", "biggest_gap"}
+    ▼
+ decision: Δclean > --min-delta (faults not worse) → win; Δ < -min-delta → loss;
+           otherwise the critic decides. A win makes the candidate the champion.
+```
+
+The critic sees only what the builder may see (code and per-family rates), so
+its gap text cannot leak private judge output. The loop stops when the
+champion reaches `--target-clean`, when the evaluation budget runs out (the
+reference evaluation counts against it), after `--patience` rounds with no new
+champion, or after `--max-rounds`.
+
+```bash
+vllm serve /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril/traffic-sign-bench/checkpoints/Qwen/Qwen3.8-27B-FP8 \
+  --served-model-name Qwen3.8-27B-FP8 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml \
+  --reasoning-parser qwen3
+```
+
+```bash
+python -m traffic_bench.policy_lab.gauntlet \
+   --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/g1 \
+   --image /scratch/policy_lab/policy.sif \
+   --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
+   --gpu --device cuda \
+   --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
+   --episodes-per-eval 60 --max-evals 20 \
+   --llm-url http://<vllm host>:8000/v1 --model Qwen3.8-27B-FP8
+```
+
+`runs/g1/` gets `progress.md` (live champion and round table),
+`gauntlet.jsonl`, `round_NN_builder.jsonl`, `round_NN_critic.json` (the
+critic's exact prompt, the A/B mapping and its reply), the `eval_NNN/` dirs,
+and `final/sandbox` (the champion's evaluation snapshot), which you score with
+step 6 as before. `--critic-url`/`--critic-model` point the critic at another
+server or model.
+
 ## Notes and limits
 
 * If `--network none` is not allowed for unprivileged users on the cluster,
