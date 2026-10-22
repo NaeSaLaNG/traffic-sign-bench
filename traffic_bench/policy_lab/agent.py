@@ -266,6 +266,12 @@ class SandboxTools:
             out = "".join(x.decode(errors="replace") if isinstance(x, bytes) else x
                           for x in (exc.stdout, exc.stderr) if x)
             return _clip(f"[timeout after {timeout_s}s]\n{_drop_apptainer_noise(out)}")
+        fatal = [l for l in proc.stderr.splitlines() if l.startswith("FATAL:")]
+        if fatal:
+            # The container itself did not start; the model never sees host paths, the operator must.
+            print(f"[agent] apptainer failed (exit {proc.returncode}): {' | '.join(fatal)[:1000]}", flush=True)
+            return _clip(f"exit code {proc.returncode}\n[the sandbox container failed to start; "
+                         "this is an infrastructure problem, not your command]")
         return _clip(f"exit code {proc.returncode}\n{_drop_apptainer_noise(proc.stdout + proc.stderr)}")
 
     def run_judge(self, policy_path: str) -> tuple[Path, dict | None, str | None]:

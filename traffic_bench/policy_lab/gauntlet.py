@@ -176,7 +176,9 @@ class Gauntlet:
                 clean = "n/a" if r.get("clean") is None else f"{r['clean']:.3f}"
                 parts.append(f"- round {r['round']}: `{r.get('candidate') or '-'}` clean {clean} -> {r['verdict']}")
         parts += ["", f"Write your policy as a new file `policies/r{rnd:02d}_<short_name>.py` "
-                      "(do not overwrite older files), then call `propose`."]
+                      "(do not overwrite older files), then call `propose`.",
+                  f"You have {self.args.builder_turns} tool turns this round; a round that ends without "
+                  "`propose` is wasted. Spend at most a third of them reading, then write, check and propose."]
         return "\n".join(parts)
 
     # --- builder ----------------------------------------------------------
@@ -189,8 +191,15 @@ class Gauntlet:
         transcript = open(self.run_dir / f"round_{rnd:02d}_builder.jsonl", "a", encoding="utf-8")
         check_failures = 0
         idle = 0
+        wrote = False
         try:
             for turn in range(self.args.builder_turns):
+                left = self.args.builder_turns - turn
+                if left in (self.args.builder_turns * 2 // 3, self.args.builder_turns // 3, 3) and turn > 0:
+                    nudge = f"{left} tool turns left in this round."
+                    if not wrote:
+                        nudge += f" You have not written a policy yet: write policies/r{rnd:02d}_<name>.py now."
+                    messages.append({"role": "user", "content": nudge + " Call `propose` before you run out."})
                 _shrink_history(messages, self.args.context_chars)
                 try:
                     reply = self.builder_llm.chat([{k: v for k, v in m.items() if not k.startswith("_")}
@@ -239,6 +248,7 @@ class Gauntlet:
                                     return None, "policy failed check_policy.py too many times"
                         elif name in ("list_dir", "read_file", "write_file", "run"):
                             result = self.tools.call(name, call_args)
+                            wrote = wrote or (name == "write_file" and result.startswith("wrote"))
                         else:
                             result = f"unknown tool {name!r}"
                     messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": result})

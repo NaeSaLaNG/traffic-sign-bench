@@ -80,19 +80,21 @@ def summarize(episodes: list[dict]) -> dict:
         def frac(pred) -> float:
             return round(sum(1 for r in runs if pred(r)) / n, 3)
 
-        def clean(r) -> bool:
-            return (r.get("ok") and not r.get("policy_fault") and r.get("success")
-                    and int(r.get("sign_violations", 0)) == 0
+        def no_violation(r) -> bool:
+            # Crosswalk and traffic-light infractions are counted apart from sign_violations.
+            return (int(r.get("sign_violations", 0)) == 0
                     and int(r.get("traffic_light_violations", 0)) == 0
                     and int(r.get("crosswalk_violations", 0)) == 0)
+
+        def clean(r) -> bool:
+            return r.get("ok") and not r.get("policy_fault") and r.get("success") and no_violation(r)
 
         completion = [float(r.get("route_completion_pct") or 0.0) for r in runs if r.get("ok")]
         return {
             "episodes": n,
             "clean_success_rate": frac(clean),
             "success_rate": frac(lambda r: r.get("ok") and not r.get("policy_fault") and r.get("success")),
-            "no_sign_violation_rate": frac(lambda r: r.get("ok") and not r.get("policy_fault")
-                                           and int(r.get("sign_violations", 0)) == 0),
+            "no_sign_violation_rate": frac(lambda r: r.get("ok") and not r.get("policy_fault") and no_violation(r)),
             "collision_rate": frac(lambda r: bool(r.get("crashed"))),
             "out_of_road_rate": frac(lambda r: bool(r.get("out_of_road"))),
             "policy_fault_rate": frac(lambda r: bool(r.get("policy_fault"))),
