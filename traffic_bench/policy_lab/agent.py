@@ -135,16 +135,17 @@ def format_tool_call(name: str, arguments, limit: int = 500) -> str:
 
 class LLMClient:
     def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int,
-                 thinking: bool = True):
+                 thinking: bool = True, think_budget: int = 0):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.thinking = thinking
+        self.think_budget = think_budget  # reasoning tokens per reply; 0 = unlimited
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None,
-             temperature: float | None = None) -> dict:
+    def _payload(self, messages: list[dict], tools: list[dict] | None, temperature: float | None,
+                 thinking: bool) -> dict:
         payload = {
             "model": self.model,
             "messages": messages,
@@ -154,9 +155,33 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        if not self.thinking:
+        if not thinking:
             # Qwen3-style templates: skip the <think> block, far fewer output tokens per turn.
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        return payload
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             temperature: float | None = None) -> dict:
+        if not (self.thinking and self.think_budget > 0):
+            return self._post(self._payload(messages, tools, temperature, self.thinking))
+        try:
+            reply, reasoning = self._stream_with_budget(self._payload(messages, tools, temperature, True))
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as exc:
+            print(f"[agent] streaming request failed ({exc}); retrying without streaming", flush=True)
+            return self._post(self._payload(messages, tools, temperature, True))
+        if reply is not None:
+            return reply
+        # Over the budget before any answer: answer now without thinking, from the notes so far.
+        print(f"[agent] thinking passed {self.think_budget} tokens; answering without it", flush=True)
+        tail = " ".join(strip_reasoning(reasoning).split() or reasoning.split())[-1500:]
+        note = {"role": "user", "content": "Your thinking budget for this turn is used up. The end of your "
+                                           f"notes:\n...{tail}\nAct on them now with a tool call."}
+        reply = self._post(self._payload(messages + [note], tools, temperature, False))
+        reply["reasoning_content"] = reasoning
+        return reply
+
+    def _open(self, payload: dict):
+        """POST with retries; returns the open HTTP response."""
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -164,8 +189,7 @@ class LLMClient:
         for attempt in range(5):
             req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=900) as resp:
-                    return json.loads(resp.read())["choices"][0]["message"]
+                return urllib.request.urlopen(req, timeout=900)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:2000]
                 if 400 <= exc.code < 500 and exc.code != 429:
@@ -181,6 +205,69 @@ class LLMClient:
                 print(f"[agent] LLM request failed ({exc}); retrying", flush=True)
                 time.sleep(10 * (attempt + 1))
         raise RuntimeError("unreachable")
+
+    def _post(self, payload: dict) -> dict:
+        with self._open(payload) as resp:
+            return json.loads(resp.read())["choices"][0]["message"]
+
+    def _stream_with_budget(self, payload: dict) -> tuple[dict | None, str]:
+        """Stream a reply, counting reasoning tokens (one per delta).
+
+        Returns (message, reasoning), or (None, reasoning) once the reasoning
+        passes ``think_budget`` before any answer has started; closing the
+        stream makes vLLM abort the generation. Reasoning comes in
+        ``reasoning_content``/``reasoning`` with vLLM's ``--reasoning-parser``,
+        or inline as ``<think>...</think>`` content without it.
+        """
+        reasoning: list[str] = []
+        content: list[str] = []
+        calls: dict[int, dict] = {}
+        think_tokens = 0
+        inline_think = None  # None: content not started; True: inside an inline <think> block
+        tail = ""
+        with self._open(dict(payload, stream=True)) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                choices = json.loads(data).get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                r = delta.get("reasoning_content") or delta.get("reasoning")
+                if r:
+                    reasoning.append(r)
+                    think_tokens += 1
+                c = delta.get("content")
+                if c:
+                    content.append(c)
+                    if inline_think is None:
+                        inline_think = c.lstrip().startswith("<think>")
+                    if inline_think:
+                        think_tokens += 1
+                        if "</think>" in tail + c:
+                            inline_think = False
+                        tail = (tail + c)[-16:]
+                for tc in delta.get("tool_calls") or []:
+                    slot = calls.setdefault(int(tc.get("index", 0)), {
+                        "id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    slot["function"]["name"] += fn.get("name") or ""
+                    slot["function"]["arguments"] += fn.get("arguments") or ""
+                answering = bool(calls) or inline_think is False or (bool(content) and not inline_think)
+                if think_tokens > self.think_budget and not answering:
+                    return None, "".join(reasoning) or "".join(content)
+        message: dict = {"role": "assistant", "content": "".join(content) or None}
+        if calls:
+            message["tool_calls"] = [dict(calls[i], id=calls[i]["id"] or f"call_{i}") for i in sorted(calls)]
+        if reasoning:
+            message["reasoning_content"] = "".join(reasoning)
+        return message, message.get("reasoning_content", "")
 
 
 @dataclass
@@ -516,6 +603,10 @@ def add_speed_args(ap: argparse.ArgumentParser) -> None:
                     help="GPU indices for the policy processes during evaluation, e.g. 2 or 1,2")
     ap.add_argument("--no-think", action="store_true",
                     help="disable the model's reasoning block (Qwen3 chat_template_kwargs.enable_thinking=false)")
+    ap.add_argument("--think-budget", type=int, default=0,
+                    help="cap the reasoning block at about this many tokens per turn (0 = no cap); past it the "
+                         "turn is answered without thinking, from the notes so far. Needs a streaming "
+                         "OpenAI-compatible server; best with vLLM --reasoning-parser")
 
 
 def hooks_enabled(args: argparse.Namespace) -> bool:
@@ -547,7 +638,8 @@ def run_agent(args: argparse.Namespace) -> dict:
         judge_gpus=args.judge_gpus,
     ), hooks=hooks_enabled(args))
     llm = LLMClient(args.llm_url, args.model, os.environ.get("POLICY_LAB_LLM_API_KEY"),
-                    args.temperature, args.max_tokens, thinking=not args.no_think)
+                    args.temperature, args.max_tokens, thinking=not args.no_think,
+                    think_budget=args.think_budget)
 
     task = (sandbox / "TASK.md").read_text(encoding="utf-8")
     messages: list[dict] = [

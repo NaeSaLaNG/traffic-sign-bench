@@ -191,7 +191,10 @@ class Gauntlet:
     def build(self, rnd: int) -> tuple[str | None, str]:
         """Run one builder conversation. Returns (policy_path, note)."""
         messages: list[dict] = [
-            {"role": "system", "content": BUILDER_PROMPT},
+            {"role": "system", "content": BUILDER_PROMPT + (
+                f"\n\nThink briefly: at most a few short paragraphs (about {self.args.think_budget} tokens) "
+                "per turn; longer thinking is cut off." if self.args.think_budget and not self.args.no_think
+                else "")},
             {"role": "user", "content": self.brief(rnd)},
         ]
         transcript = open(self.run_dir / f"round_{rnd:02d}_builder.jsonl", "a", encoding="utf-8")
@@ -476,7 +479,7 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
     ), hooks=hooks_enabled(args))
     api_key = os.environ.get("POLICY_LAB_LLM_API_KEY")
     builder_llm = LLMClient(args.llm_url, args.model, api_key, args.temperature, args.max_tokens,
-                            thinking=not args.no_think)
+                            thinking=not args.no_think, think_budget=args.think_budget)
     critic_llm = LLMClient(args.critic_url or args.llm_url, args.critic_model or args.model, api_key,
                            args.critic_temperature, args.max_tokens)
     g = Gauntlet(
