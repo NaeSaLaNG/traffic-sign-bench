@@ -45,6 +45,7 @@ from traffic_bench.policy_lab.agent import (
     _shrink_history,
     format_tool_call,
     add_launcher_args,
+    add_speed_args,
     container_spec,
     strip_reasoning,
 )
@@ -191,8 +192,13 @@ class Gauntlet:
         try:
             for turn in range(self.args.builder_turns):
                 _shrink_history(messages, self.args.context_chars)
-                reply = self.builder_llm.chat([{k: v for k, v in m.items() if not k.startswith("_")}
-                                               for m in messages], BUILDER_TOOLS)
+                try:
+                    reply = self.builder_llm.chat([{k: v for k, v in m.items() if not k.startswith("_")}
+                                                   for m in messages], BUILDER_TOOLS)
+                except RuntimeError as exc:
+                    # A rejected request (e.g. context overflow) ends this round, not the whole gauntlet.
+                    print(f"[gauntlet] round {rnd} turn {turn}: {exc}", flush=True)
+                    return None, f"builder request rejected: {str(exc)[:300]}"
                 assistant = {"role": "assistant", "content": reply.get("content") or ""}
                 calls = reply.get("tool_calls") or []
                 if calls:
@@ -400,6 +406,9 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
     run_dir = Path(args.run_dir).resolve()
     if run_dir == sandbox or sandbox in run_dir.parents:
         raise SystemExit("--run-dir must be outside the sandbox")
+    if not (sandbox / "TASK.md").is_file():
+        raise SystemExit(f"{sandbox} is not a policy-lab sandbox (no TASK.md); create it with "
+                         f"`python -m traffic_bench.policy_lab.export_sandbox --out {sandbox}`")
     run_dir.mkdir(parents=True, exist_ok=True)
     container = container_spec(args)
     tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
@@ -410,9 +419,12 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
         gpu=args.gpu,
         device=args.device,
         scenes_root=args.scenes_root,
+        save_gifs=args.save_gifs,
+        gif_window_m=args.gif_window,
     ))
     api_key = os.environ.get("POLICY_LAB_LLM_API_KEY")
-    builder_llm = LLMClient(args.llm_url, args.model, api_key, args.temperature, args.max_tokens)
+    builder_llm = LLMClient(args.llm_url, args.model, api_key, args.temperature, args.max_tokens,
+                            thinking=not args.no_think)
     critic_llm = LLMClient(args.critic_url or args.llm_url, args.critic_model or args.model, api_key,
                            args.critic_temperature, args.max_tokens)
     g = Gauntlet(
@@ -475,8 +487,10 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--critic-temperature", type=float, default=0.0)
     ap.add_argument("--max-tokens", type=int, default=8192)
-    ap.add_argument("--context-chars", type=int, default=240_000,
-                    help="approximate builder transcript budget before old tool outputs are dropped")
+    ap.add_argument("--context-chars", type=int, default=80_000,
+                    help="approximate builder transcript budget before old tool outputs are dropped "
+                         "(~3 chars per token: 80k fits max_model_len 32768, use ~3x max_model_len)")
+    add_speed_args(ap)
     args = ap.parse_args()
     final = run_gauntlet(args)
     print(json.dumps({k: final[k] for k in ("submitted", "stop_reason", "evals_used")}, indent=2,

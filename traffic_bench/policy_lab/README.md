@@ -162,8 +162,16 @@ vllm serve /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril
   --served-model-name Qwen3.8-27B-FP8 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_xml \
-  --reasoning-parser qwen3
+  --reasoning-parser qwen3 \
+  --max-model-len 65536 \
+  --enable-prefix-caching
 ```
+
+`--max-model-len` is the server's context window. Above the model's native
+length add YaRN, e.g. `--rope-scaling '{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}'`
+(check `max_position_embeddings` in the checkpoint's `config.json` first). If
+vLLM refuses to start for lack of KV-cache memory, lower `--max-model-len` or
+raise `--gpu-memory-utilization`.
 
 ```bash
 python -m traffic_bench.policy_lab.gauntlet \
@@ -173,8 +181,21 @@ python -m traffic_bench.policy_lab.gauntlet \
    --gpu --device cuda \
    --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
    --episodes-per-eval 60 --max-evals 20 \
+   --context-chars 160000 --builder-turns 30 --no-think --save-gifs \
    --llm-url http://<vllm host>:8000/v1 --model Qwen3.8-27B-FP8
 ```
+
+* `--context-chars` must fit the server: about 3 characters per token, so
+  80 000 (the default) for `--max-model-len 32768` and 160 000 for 65536. Once
+  the builder transcript passes it, the oldest tool outputs are blanked. A
+  request the server still rejects (HTTP 4xx) ends that round instead of being
+  retried.
+* `--no-think` turns off Qwen3's reasoning block for the builder (the critic
+  keeps it). Turns get much faster; policies may get somewhat worse.
+* `--builder-turns` caps the tool calls per round (default 60).
+* `--save-gifs` writes one GIF per episode to `eval_NNN/gifs/`. They stay on
+  the trusted side, but rendering slows each evaluation. `--gif-window` sets the
+  view in metres (default 80).
 
 `runs/g1/` gets `progress.md` (live champion and round table),
 `gauntlet.jsonl`, `round_NN_builder.jsonl`, `round_NN_critic.json` (the

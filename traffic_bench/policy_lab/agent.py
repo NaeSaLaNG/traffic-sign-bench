@@ -129,12 +129,14 @@ def format_tool_call(name: str, arguments, limit: int = 500) -> str:
 
 
 class LLMClient:
-    def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int):
+    def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int,
+                 thinking: bool = True):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.thinking = thinking
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None,
              temperature: float | None = None) -> dict:
@@ -147,6 +149,9 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if not self.thinking:
+            # Qwen3-style templates: skip the <think> block, far fewer output tokens per turn.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -156,6 +161,15 @@ class LLMClient:
             try:
                 with urllib.request.urlopen(req, timeout=900) as resp:
                     return json.loads(resp.read())["choices"][0]["message"]
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:2000]
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    # Same body gets the same answer (e.g. prompt over max_model_len); do not retry.
+                    raise RuntimeError(f"LLM request rejected: HTTP {exc.code}: {detail}") from exc
+                if attempt == 4:
+                    raise RuntimeError(f"LLM request failed: HTTP {exc.code}: {detail}") from exc
+                print(f"[agent] LLM request failed (HTTP {exc.code}: {detail[:300]}); retrying", flush=True)
+                time.sleep(10 * (attempt + 1))
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt == 4:
                     raise
@@ -173,6 +187,8 @@ class EvalConfig:
     gpu: bool
     device: str
     scenes_root: str | None = None
+    save_gifs: bool = False
+    gif_window_m: float = 80.0
 
 
 class SandboxTools:
@@ -286,6 +302,9 @@ class SandboxTools:
             cmd.append("--allow-network")
         if self.evalcfg.scenes_root:
             cmd += ["--scenes-root", self.evalcfg.scenes_root]
+        if self.evalcfg.save_gifs:
+            # Private: next to the snapshot, never inside it, so the model cannot see them.
+            cmd += ["--gif-dir", str(eval_dir / "gifs"), "--gif-window", str(self.evalcfg.gif_window_m)]
         with open(eval_dir / "judge.log", "w") as log:
             proc = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         if proc.returncode != 0 or not feedback_path.is_file():
@@ -375,6 +394,14 @@ def add_launcher_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--apptainer-bin", default="apptainer")
 
 
+def add_speed_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--save-gifs", action="store_true",
+                    help="save one GIF per episode under eval_NNN/gifs (private; slows evaluation)")
+    ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--no-think", action="store_true",
+                    help="disable the model's reasoning block (Qwen3 chat_template_kwargs.enable_thinking=false)")
+
+
 def container_spec(args: argparse.Namespace) -> ContainerSpec:
     if args.launcher == "apptainer" and not args.image:
         raise SystemExit("--image is required with --launcher apptainer")
@@ -395,6 +422,9 @@ def run_agent(args: argparse.Namespace) -> dict:
     run_dir = Path(args.run_dir).resolve()
     if run_dir == sandbox or sandbox in run_dir.parents:
         raise SystemExit("--run-dir must be outside the sandbox")
+    if not (sandbox / "TASK.md").is_file():
+        raise SystemExit(f"{sandbox} is not a policy-lab sandbox (no TASK.md); create it with "
+                         f"`python -m traffic_bench.policy_lab.export_sandbox --out {sandbox}`")
     run_dir.mkdir(parents=True, exist_ok=True)
     container = container_spec(args)
     tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
@@ -405,9 +435,11 @@ def run_agent(args: argparse.Namespace) -> dict:
         gpu=args.gpu,
         device=args.device,
         scenes_root=args.scenes_root,
+        save_gifs=args.save_gifs,
+        gif_window_m=args.gif_window,
     ))
     llm = LLMClient(args.llm_url, args.model, os.environ.get("POLICY_LAB_LLM_API_KEY"),
-                    args.temperature, args.max_tokens)
+                    args.temperature, args.max_tokens, thinking=not args.no_think)
 
     task = (sandbox / "TASK.md").read_text(encoding="utf-8")
     messages: list[dict] = [
@@ -490,8 +522,10 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max-tokens", type=int, default=8192)
-    ap.add_argument("--context-chars", type=int, default=240_000,
-                    help="approximate transcript budget before old tool outputs are dropped")
+    ap.add_argument("--context-chars", type=int, default=80_000,
+                    help="approximate transcript budget before old tool outputs are dropped "
+                         "(~3 chars per token: 80k fits max_model_len 32768, use ~3x max_model_len)")
+    add_speed_args(ap)
     args = ap.parse_args()
     final = run_agent(args)
     print(json.dumps(final, indent=2, ensure_ascii=False))
