@@ -18,7 +18,6 @@ so its gap text cannot leak the private judge output.
 
     python -m traffic_bench.policy_lab.gauntlet \
         --sandbox $LAB/sandbox --run-dir $LAB/runs/g1 \
-        --image $LAB/policy.sif \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --dev-manifest data/runs/policy_lab/dev/manifest.jsonl \
         --llm-url http://gpu-node:8000/v1 --model Qwen3.8-27B-FP8
@@ -44,9 +43,9 @@ from traffic_bench.policy_lab.agent import (
     _clip,
     _shrink_history,
     format_tool_call,
-    add_launcher_args,
+    add_hook_args,
+    hooks_enabled,
     add_speed_args,
-    container_spec,
     strip_reasoning,
 )
 
@@ -261,7 +260,7 @@ class Gauntlet:
             transcript.close()
 
     def _gate(self, policy_path) -> tuple[str, str | None]:
-        """check_policy.py in the container, run by the orchestrator, not the builder."""
+        """check_policy.py, run by the orchestrator, not the builder."""
         try:
             rel = str(self.tools._resolve(policy_path).relative_to(self.tools.root))
         except Exception as exc:
@@ -270,6 +269,9 @@ class Gauntlet:
             return "policy_path must be a .py file", None
         if self.champion and rel == self.champion.path:
             return "that is the champion itself; propose a new file", None
+        blocked = self.tools.hooks.before("gate", {"policy_path": rel}) if self.tools.hooks else None
+        if blocked:
+            return blocked, None
         out = self.tools.run(f"python check_policy.py {_shell_quote(rel)}", timeout_s=600)
         if not out.startswith("exit code 0"):
             return "check_policy.py failed; fix the policy and propose again:\n" + out, None
@@ -420,18 +422,16 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
         raise SystemExit(f"{sandbox} is not a policy-lab sandbox (no TASK.md); create it with "
                          f"`python -m traffic_bench.policy_lab.export_sandbox --out {sandbox}`")
     run_dir.mkdir(parents=True, exist_ok=True)
-    container = container_spec(args)
-    tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
+    tools = SandboxTools(sandbox, run_dir, Path(args.checkpoint), EvalConfig(
         judge_python=args.judge_python,
         dev_manifest=args.dev_manifest,
         max_episodes=args.episodes_per_eval,
         max_evals=args.max_evals,
-        gpu=args.gpu,
         device=args.device,
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
-    ))
+    ), hooks=hooks_enabled(args))
     api_key = os.environ.get("POLICY_LAB_LLM_API_KEY")
     builder_llm = LLMClient(args.llm_url, args.model, api_key, args.temperature, args.max_tokens,
                             thinking=not args.no_think)
@@ -471,11 +471,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sandbox", required=True)
     ap.add_argument("--run-dir", required=True, help="private transcripts and eval results (outside the sandbox)")
-    add_launcher_args(ap)
+    add_hook_args(ap)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--gpu", action="store_true")
-    ap.add_argument("--device", default="cpu", help="torch device for CaRL inside the container")
-    ap.add_argument("--allow-network", action="store_true", help="do not pass --network none")
+    ap.add_argument("--device", default="cpu", help="torch device for CaRL in the policy process")
     ap.add_argument("--dev-manifest", required=True, help="manifest the policies are evaluated on")
     ap.add_argument("--scenes-root", default=None)
     ap.add_argument("--episodes-per-eval", type=int, default=60)

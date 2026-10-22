@@ -1,7 +1,7 @@
 """Policy server: loads ``Policy`` from a file and answers the simulator.
 
-    python -m carl_sandbox.runtime --socket /ipc/policy.sock \
-        --policy policies/v1.py --checkpoint /ckpt/carl.pth
+    python -m carl_sandbox.runtime --socket <dir>/policy.sock \
+        --policy policies/v1.py --checkpoint "$CARL_CHECKPOINT"
 
 The policy module must define ``class Policy`` with
 ``__init__(self, carl: CarlDriver)``, ``reset(self, info: dict)`` and

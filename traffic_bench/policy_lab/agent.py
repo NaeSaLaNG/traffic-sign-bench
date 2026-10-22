@@ -2,9 +2,11 @@
 
 This process is trusted: it holds the tool implementations and is the only
 thing that touches both sides. The model reaches the world only through the
-tools below: file access confined to the sandbox, shell commands inside the
-Apptainer container, and ``evaluate``, which runs the judge in a separate
+tools below: file access confined to the sandbox, shell commands run in the
+sandbox directory, and ``evaluate``, which runs the judge in a separate
 process on a snapshot of the sandbox and returns aggregate metrics only.
+Model-written code runs on the host, so ``hooks.py`` checks every command and
+file before it runs.
 
 The model is served by vLLM (or anything with an OpenAI-compatible
 ``/v1/chat/completions`` that supports tool calls), e.g.
@@ -13,7 +15,6 @@ The model is served by vLLM (or anything with an OpenAI-compatible
 
     python -m traffic_bench.policy_lab.agent \
         --sandbox $LAB/sandbox --run-dir $LAB/runs/r1 \
-        --image $LAB/policy.sif \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --dev-manifest data/runs/policy_lab/dev/manifest.jsonl \
         --llm-url http://gpu-node:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
@@ -25,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -33,7 +35,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from traffic_bench.policy_lab.container import ContainerSpec, apptainer_exec, local_env
+from traffic_bench.policy_lab.sandbox_env import sandbox_env
+from traffic_bench.policy_lab.hooks import HarnessHooks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAX_TOOL_OUTPUT = 12_000
@@ -65,8 +68,9 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "run",
-        "description": "Run a shell command in the sandbox root inside the policy container "
-                       "(no network). Returns exit code and output.",
+        "description": "Run a shell command in the sandbox root, in the policy's environment. "
+                       "The harness refuses paths outside the sandbox, network, subprocesses and "
+                       "dynamic code. Returns exit code and output.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
             "timeout_s": {"type": "integer", "default": 300}},
@@ -184,7 +188,6 @@ class EvalConfig:
     dev_manifest: str
     max_episodes: int
     max_evals: int
-    gpu: bool
     device: str
     scenes_root: str | None = None
     save_gifs: bool = False
@@ -192,10 +195,13 @@ class EvalConfig:
 
 
 class SandboxTools:
-    def __init__(self, sandbox: Path, run_dir: Path, container: ContainerSpec, evalcfg: EvalConfig):
+    def __init__(self, sandbox: Path, run_dir: Path, checkpoint: Path, evalcfg: EvalConfig,
+                 hooks: bool = True):
         self.root = Path(sandbox).resolve()
         self.run_dir = Path(run_dir).resolve()
-        self.container = container
+        # Checks on the model's tool calls before they run (hooks.py); the sandbox as it is now is trusted.
+        self.hooks = HarnessHooks(self.root, self.run_dir) if hooks else None
+        self.checkpoint = Path(checkpoint).resolve()
         self.evalcfg = evalcfg
         self.evals_used = 0
         self.eval_attempts = 0
@@ -253,26 +259,17 @@ class SandboxTools:
 
     def run(self, command: str, timeout_s: int = 300) -> str:
         timeout_s = max(5, min(int(timeout_s), 600))
-        if self.container.launcher == "local":
-            argv = ["/bin/sh", "-c", command]
-            env, cwd = local_env(self.root, self.container.checkpoint), self.root
-        else:
-            argv = apptainer_exec(self.container, self.root, ["/bin/sh", "-c", command], sandbox_writable=True)
-            env, cwd = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}, None
+        # Own process group: a timeout also kills whatever the command started in the background.
+        proc = subprocess.Popen(["/bin/sh", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", env=sandbox_env(self.root, self.checkpoint),
+                                cwd=self.root, start_new_session=True)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout_s,
-                                  env=env, cwd=cwd)
-        except subprocess.TimeoutExpired as exc:
-            out = "".join(x.decode(errors="replace") if isinstance(x, bytes) else x
-                          for x in (exc.stdout, exc.stderr) if x)
-            return _clip(f"[timeout after {timeout_s}s]\n{_drop_apptainer_noise(out)}")
-        fatal = [l for l in proc.stderr.splitlines() if l.startswith("FATAL:")]
-        if fatal:
-            # The container itself did not start; the model never sees host paths, the operator must.
-            print(f"[agent] apptainer failed (exit {proc.returncode}): {' | '.join(fatal)[:1000]}", flush=True)
-            return _clip(f"exit code {proc.returncode}\n[the sandbox container failed to start; "
-                         "this is an infrastructure problem, not your command]")
-        return _clip(f"exit code {proc.returncode}\n{_drop_apptainer_noise(proc.stdout + proc.stderr)}")
+            out, _ = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, _ = proc.communicate()
+            return _clip(f"[timeout after {timeout_s}s]\n{out}")
+        return _clip(f"exit code {proc.returncode}\n{out}")
 
     def run_judge(self, policy_path: str) -> tuple[Path, dict | None, str | None]:
         """Run the judge on a snapshot of the sandbox, spending one evaluation.
@@ -291,21 +288,13 @@ class SandboxTools:
         cmd = [
             self.evalcfg.judge_python, "-m", "traffic_bench.policy_lab.judge",
             "--sandbox", str(snapshot), "--policy", rel,
-            "--checkpoint", str(self.container.checkpoint),
-            "--launcher", self.container.launcher,
-            "--apptainer-bin", self.container.apptainer_bin,
+            "--checkpoint", str(self.checkpoint),
             "--manifest", self.evalcfg.dev_manifest,
             "--max-episodes", str(self.evalcfg.max_episodes),
             "--device", self.evalcfg.device,
             "--private-dir", str(eval_dir / "judge"),
             "--out", str(feedback_path),
         ]
-        if self.container.image is not None:
-            cmd += ["--image", str(self.container.image)]
-        if self.evalcfg.gpu:
-            cmd.append("--gpu")
-        if not self.container.isolate_network:
-            cmd.append("--allow-network")
         if self.evalcfg.scenes_root:
             cmd += ["--scenes-root", self.evalcfg.scenes_root]
         if self.evalcfg.save_gifs:
@@ -332,7 +321,7 @@ class SandboxTools:
         policy_log = eval_dir / "judge" / "policy.log"
         if not policy_log.is_file():
             return ""
-        return "\n".join(_drop_apptainer_noise(policy_log.read_text(errors="replace")).splitlines()[-lines:])
+        return "\n".join(policy_log.read_text(errors="replace").splitlines()[-lines:])
 
     def evaluate(self, policy_path: str) -> str:
         if self.evals_used >= self.evalcfg.max_evals:
@@ -360,16 +349,12 @@ class SandboxTools:
         if fn is None:
             return f"unknown tool {name!r}"
         try:
-            return fn(**args)
+            blocked = self.hooks.before(name, args) if self.hooks else None
+            return blocked or fn(**args)
         except TypeError as exc:
             return f"bad arguments for {name}: {exc}"
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}"
-
-
-def _drop_apptainer_noise(text: str) -> str:
-    """Apptainer's own INFO/WARNING lines name host paths; drop them."""
-    return "\n".join(l for l in text.splitlines() if not l.startswith(("INFO:", "WARNING:", "FATAL:")))
 
 
 def strip_reasoning(text: str) -> str:
@@ -393,11 +378,10 @@ def _shrink_history(messages: list[dict], budget_chars: int) -> None:
             total += len(m["content"])
 
 
-def add_launcher_args(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("--launcher", choices=["apptainer", "local"], default="apptainer",
-                    help="local runs policies and the run tool without a container (debug only: no isolation)")
-    ap.add_argument("--image", default=None, help="Apptainer .sif for the policy container (launcher=apptainer)")
-    ap.add_argument("--apptainer-bin", default="apptainer")
+def add_hook_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--no-harness-hooks", action="store_true",
+                    help="do not check the model's commands and code before they run (hooks.py); "
+                         "model-written code then runs on the host unchecked")
 
 
 def add_speed_args(ap: argparse.ArgumentParser) -> None:
@@ -408,19 +392,10 @@ def add_speed_args(ap: argparse.ArgumentParser) -> None:
                     help="disable the model's reasoning block (Qwen3 chat_template_kwargs.enable_thinking=false)")
 
 
-def container_spec(args: argparse.Namespace) -> ContainerSpec:
-    if args.launcher == "apptainer" and not args.image:
-        raise SystemExit("--image is required with --launcher apptainer")
-    if args.launcher == "local":
-        print("[policy_lab] launcher=local: model-written code runs on the host without isolation", flush=True)
-    return ContainerSpec(
-        image=Path(args.image).resolve() if args.image else None,
-        checkpoint=Path(args.checkpoint).resolve(),
-        apptainer_bin=args.apptainer_bin,
-        gpu=args.gpu,
-        isolate_network=not args.allow_network,
-        launcher=args.launcher,
-    )
+def hooks_enabled(args: argparse.Namespace) -> bool:
+    if args.no_harness_hooks:
+        print("[policy_lab] harness hooks OFF: model-written code runs on the host unchecked", flush=True)
+    return not args.no_harness_hooks
 
 
 def run_agent(args: argparse.Namespace) -> dict:
@@ -432,18 +407,16 @@ def run_agent(args: argparse.Namespace) -> dict:
         raise SystemExit(f"{sandbox} is not a policy-lab sandbox (no TASK.md); create it with "
                          f"`python -m traffic_bench.policy_lab.export_sandbox --out {sandbox}`")
     run_dir.mkdir(parents=True, exist_ok=True)
-    container = container_spec(args)
-    tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
+    tools = SandboxTools(sandbox, run_dir, Path(args.checkpoint), EvalConfig(
         judge_python=args.judge_python,
         dev_manifest=args.dev_manifest,
         max_episodes=args.episodes_per_eval,
         max_evals=args.max_evals,
-        gpu=args.gpu,
         device=args.device,
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
-    ))
+    ), hooks=hooks_enabled(args))
     llm = LLMClient(args.llm_url, args.model, os.environ.get("POLICY_LAB_LLM_API_KEY"),
                     args.temperature, args.max_tokens, thinking=not args.no_think)
 
@@ -512,11 +485,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sandbox", required=True)
     ap.add_argument("--run-dir", required=True, help="private transcripts and eval results (outside the sandbox)")
-    add_launcher_args(ap)
+    add_hook_args(ap)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--gpu", action="store_true")
-    ap.add_argument("--device", default="cpu", help="torch device for CaRL inside the container")
-    ap.add_argument("--allow-network", action="store_true", help="do not pass --network none")
+    ap.add_argument("--device", default="cpu", help="torch device for CaRL in the policy process")
     ap.add_argument("--dev-manifest", required=True, help="manifest the agent is evaluated on")
     ap.add_argument("--scenes-root", default=None)
     ap.add_argument("--episodes-per-eval", type=int, default=60)

@@ -6,7 +6,7 @@ benchmark code and none of the authors' rule-based agents, and it learns how
 well a policy does only from aggregate metrics.
 
 ```
- trusted side (full repo)                         sandbox (Apptainer, no network)
+ trusted side (full repo)                         sandbox (host process, harness hooks)
  ─────────────────────────                         ───────────────────────────────
  agent.py ── tool calls ──────────────────────────▶ list/read/write files, run shell
     │  evaluate(policy) → snapshot of the sandbox
@@ -24,8 +24,8 @@ well a policy does only from aggregate metrics.
 |---|---|
 | `TASK.md`, `carl_sandbox/` (CaRL wrapper, runtime), `check_policy.py`, `policies/` | `traffic_bench/` entirely: `signs/**` (violation logic, zones, thresholds), `eval/**`, `agents/compliance/**`, `*_rule.py`, `curve_aware_idm.py`, `oracle/`, `finetune/`, `scripts/`, docs, READMEs |
 | `third_party/CaRL/nuPlan` (upstream CaRL code) | `.git` and its history, `__pycache__`, `*.egg-info`, `data/runs/` |
-| the CaRL checkpoint, read-only at `/ckpt/carl.pth` | `$HOME` (HF token, `~/.cursor`, shell history), host env vars, the NFS repo path |
-| `plates.txt`: names of the plates that can appear | the network (`--network none`) |
+| the CaRL checkpoint, at `$CARL_CHECKPOINT` | `$HOME` (HF token, `~/.cursor`, shell history), host env vars, the NFS repo path |
+| `plates.txt`: names of the plates that can appear | the network (refused by the harness hooks) |
 | per-family rates: `clean_success_rate`, `success_rate`, `no_sign_violation_rate`, `collision_rate`, `out_of_road_rate`, `policy_fault_rate`, `mean_route_completion_pct` | violation timelines, violation texts, GIFs, per-episode results, judge logs |
 
 How this holds:
@@ -33,23 +33,45 @@ How this holds:
 * **Allowlist export.** `export_sandbox.py` copies only the template, the CaRL
   code, a standalone `carl_adapter.py` and the plate names, then refuses to
   finish if any text file mentions the benchmark or its rule code.
-* **Separate processes.** The policy runs in its own container and talks to the
+* **Separate processes.** The policy runs in its own process and talks to the
   simulator over a Unix socket. It receives plain data: the CaRL BEV (stop
   plates are not drawn, and the speed channel comes from map data) plus lists of
   plates, agents and route lanes. It never gets a sign object, so it cannot call
   `check_violation`. Replies are JSON with two finite floats; the judge never
   unpickles anything the policy sends.
 * **Trusted orchestrator.** `agent.py` runs the tools. File access resolves
-  symlinks and stays inside the sandbox, shell commands run in the container,
-  and evaluations run on a snapshot of the sandbox. Judge output is reduced to
-  the aggregate JSON before it reaches the model.
+  symlinks and stays inside the sandbox, shell commands run in the sandbox
+  directory with a clean environment (no API keys or tokens), and evaluations
+  run on a snapshot of the sandbox. Judge output is reduced to the aggregate
+  JSON before it reaches the model.
+* **Harness hooks.** There is no container: model-written code runs on the
+  host as your user. `hooks.py` checks every tool call before it runs and
+  refuses, with the reason, instead of executing:
+  * shell commands (`run`) with absolute paths outside the sandbox, `..`,
+    `~`/`$HOME`, network, package and VCS tools (`curl`, `pip`, `git`...),
+    process control (`kill`, `nohup`, `&`), environment dumps and assignments,
+    encoded payloads (`base64`, `eval`), or bad Python in `python -c`/heredocs;
+  * Python files (`write_file`, and any file the model added or changed,
+    checked before every `run`, `evaluate`, `submit` and the gauntlet's gate)
+    importing network, subprocess, `ctypes` or `importlib` modules, calling
+    `os.system`/`os.kill`/`eval`/`exec`/`__import__`, reaching for
+    `__globals__`/`__subclasses__`, or naming host paths in string literals;
+  * `sitecustomize.py`, `.pth` files and symlinks leading out of the sandbox.
+
+  A file that fails the checks after a shell command wrote it is moved to
+  `<run-dir>/quarantine/` (a changed template file is restored), so it never
+  runs. Every refusal goes to `<run-dir>/hooks.jsonl`. Files the sandbox had at
+  start are trusted. The hooks are a static check, not a security boundary:
+  code written to hide what it does can get past them, so keep the
+  orchestrator, the judge and your data out of reach (see Notes) and read the
+  transcripts. `--no-harness-hooks` turns them off.
 * **Faults are failures.** A crash, timeout (5 s per step), NaN or a failed load
   counts as a failed episode, so a policy cannot drop hard scenes by crashing on
   them.
 
 ## Running it on the cluster
 
-Pick a writable working directory for images, sandboxes and runs. It must be
+Pick a writable working directory for sandboxes and runs. It must be
 outside the repository (`export_sandbox` refuses a path inside it), so a sibling
 of the checkout works well. Run this from the repository root:
 
@@ -58,10 +80,11 @@ export LAB=/home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril
 mkdir -p $LAB
 ```
 
-1. Build the policy image once (it contains no benchmark code):
+1. Install the policy's dependencies into the environment you run the agent
+   from; the policy and `check_policy.py` use the same interpreter:
 
    ```bash
-   apptainer build $LAB/policy.sif traffic_bench/policy_lab/apptainer/policy.def
+   pip install "numpy<2" gymnasium==0.29.1 opencv-python-headless==4.10.0.84 scipy torch
    ```
 
 2. Export the sandbox outside the repository:
@@ -71,13 +94,12 @@ mkdir -p $LAB
    python -m traffic_bench.policy_lab.export_sandbox --out $LAB/sandbox
    ```
 
-3. Check that plain CaRL loads in the container (catches missing pip packages):
+3. Check that plain CaRL loads (catches missing pip packages):
 
    ```bash
-   apptainer exec --containall --no-home --bind $LAB/sandbox:/work \
-       --bind checkpoints/carl/nuplan_51479_1B/model_best.pth:/ckpt/carl.pth:ro --pwd /work \
-       --env PYTHONPATH=/work,CARL_NUPLAN_PATH=/work/third_party/CaRL/nuPlan \
-       $LAB/policy.sif python check_policy.py policies/carl_baseline.py
+   (cd $LAB/sandbox && PYTHONPATH=. CARL_NUPLAN_PATH=third_party/CaRL/nuPlan \
+       python check_policy.py policies/carl_baseline.py \
+       --checkpoint $OLDPWD/checkpoints/carl/nuplan_51479_1B/model_best.pth)
    ```
 
 4. Serve the model with tool calling. For Qwen-style chat templates:
@@ -96,15 +118,14 @@ mkdir -p $LAB
    python -m traffic_bench.eval manifest sign=crosswalk paths.split=train
    python -m traffic_bench.policy_lab.agent \
       --sandbox $LAB/sandbox --run-dir $LAB/runs/crosswalk \
-      --image $LAB/policy.sif \
       --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-      --gpu --device cuda \
+      --device cuda \
       --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
       --episodes-per-eval 60 --max-evals 20 \
       --llm-url http://<vllm host>:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
    ```
 
-   `runs/r1/` gets `transcript.jsonl`, one `eval_NNN/` per evaluation (sandbox
+   `runs/r1/` gets `transcript.jsonl`, `hooks.jsonl` (refused tool calls), one `eval_NNN/` per evaluation (sandbox
    snapshot, private judge output, feedback) and `final/` with the submitted
    sandbox.
 
@@ -113,19 +134,14 @@ mkdir -p $LAB
    ```bash
    python -m traffic_bench.policy_lab.judge --sandbox $LAB/runs/r1/final/sandbox \
        --policy <submitted policy> --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-       --image $LAB/policy.sif --manifest <test manifest.jsonl> \
+       --manifest <test manifest.jsonl> \
        --private-dir $LAB/runs/r1/test --out $LAB/runs/r1/test/feedback.json
    ```
 
-   `--launcher local` runs the policy without a container. It is for
-   debugging only and gives no isolation. `agent.py` and `gauntlet.py`
-   accept it too (then `--image` is not needed): the policy, `check_policy.py`
-   and the agent's `run` tool use the orchestrator's interpreter on the host,
-   with the sandbox as working directory, `CARL_CHECKPOINT` pointing at the
-   checkpoint and `CUDA_VISIBLE_DEVICES` passed through. Model-written code can
-   then read and write anything you can, and reach the network. Use it only
-   where Apptainer cannot run (e.g. pods that forbid mount namespaces), and
-   watch the run.
+   The policy, `check_policy.py` and the agent's `run` tool use the
+   orchestrator's interpreter, with the sandbox as working directory,
+   `CARL_CHECKPOINT` pointing at the checkpoint and `CUDA_VISIBLE_DEVICES`
+   passed through.
 
 ## Gauntlet loop
 
@@ -140,7 +156,7 @@ grades it:
  builder  (fresh conversation; list/read/write/run + propose, no evaluate)
     │  brief: TASK.md, champion + its metrics, critic's biggest gap, past rounds
     ▼  propose(policies/rNN_*.py)
- orchestrator: check_policy.py in the container ─ fail → back to builder
+ orchestrator: hooks + check_policy.py ─ fail → back to builder
     │  judge on the same dev episodes (one evaluation)
     ▼
  critic  (fresh, no tools): TASK.md + policies A/B in random order,
@@ -176,9 +192,8 @@ raise `--gpu-memory-utilization`.
 ```bash
 python -m traffic_bench.policy_lab.gauntlet \
    --sandbox $LAB/sandbox --run-dir $LAB/runs/g1 \
-   --image $LAB/policy.sif \
    --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-   --gpu --device cuda \
+   --device cuda \
    --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
    --episodes-per-eval 60 --max-evals 20 \
    --context-chars 160000 --builder-turns 30 --no-think --save-gifs \
@@ -231,9 +246,8 @@ server can serve all signs.
    ```bash
    python -m traffic_bench.policy_lab.gauntlet \
       --sandbox $LAB/sandbox_$SIGN --run-dir $LAB/runs/$SIGN \
-      --image $LAB/policy.sif \
       --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-      --gpu --device cuda \
+      --device cuda \
       --dev-manifest data/runs/$SIGN/train/real_manifest.jsonl \
       --episodes-per-eval 60 --max-evals 20 --min-delta 0.04 \
       --llm-url http://<vllm host>:8000/v1 --model Qwen3.8-27B-FP8
@@ -247,7 +261,7 @@ server can serve all signs.
    POLICY=$(python -c "import json;print(json.load(open('$LAB/runs/$SIGN/final.json'))['submitted']['policy_path'])")
    python -m traffic_bench.policy_lab.judge --sandbox $LAB/runs/$SIGN/final/sandbox \
       --policy $POLICY --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-      --image $LAB/policy.sif --gpu --device cuda \
+      --device cuda \
       --manifest data/runs/$SIGN/test/real_manifest.jsonl \
       --private-dir $LAB/runs/$SIGN/test --out $LAB/runs/$SIGN/test/feedback.json
    ```
@@ -260,10 +274,10 @@ can run in parallel as long as each has its own sandbox and run dir.
 
 ## Notes and limits
 
-* If `--network none` is not allowed for unprivileged users on the cluster,
-  `--allow-network` drops it; then block egress some other way.
-* Run the orchestrator, the judge and vLLM as a user whose files the model
-  never touches; the model reaches the host only through `agent.py`.
+* Model-written code runs with your user's permissions. The hooks refuse
+  anything that names a path outside the sandbox, but keep the held-out test
+  manifests and anything secret out of `$LAB` and, where you can, run the
+  orchestrator as a user that cannot write to the repository or your data.
 * **Routes on `dual_path` signs.** The policy cannot change its route. On these
   signs (one-way, no turn, direction) the judge gives a non-`*_rule` policy
   MetaDrive's default route, so the route channel may lead through a branch the

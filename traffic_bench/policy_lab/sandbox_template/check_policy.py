@@ -1,6 +1,6 @@
 """Offline smoke test: run a policy on synthetic observations, no simulator.
 
-    python check_policy.py policies/my_policy.py [--steps 50] [--checkpoint /ckpt/carl.pth]
+    python check_policy.py policies/my_policy.py [--steps 50] [--checkpoint $CARL_CHECKPOINT]
 
 Catches import errors, exceptions, wrong return types and slow steps. It says
 nothing about driving quality; use the evaluate tool for that.
@@ -45,7 +45,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("policy")
     ap.add_argument("--steps", type=int, default=50)
-    ap.add_argument("--checkpoint", default=os.environ.get("CARL_CHECKPOINT", "/ckpt/carl.pth"))
+    ap.add_argument("--checkpoint", default=os.environ.get("CARL_CHECKPOINT"))
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 

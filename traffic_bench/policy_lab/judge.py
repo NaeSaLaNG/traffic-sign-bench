@@ -7,7 +7,6 @@ violation timelines) go to ``--private-dir`` and never reach the agent; the
     python -m traffic_bench.policy_lab.judge \
         --sandbox $LAB/sandbox --policy policies/v3.py \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-        --image $LAB/policy.sif \
         --manifest data/runs/policy_lab/dev/manifest.jsonl --max-episodes 60 \
         --private-dir $LAB/judge/run_007 --out $LAB/judge/run_007/feedback.json
 """
@@ -207,12 +206,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--sandbox", required=True, type=Path)
     ap.add_argument("--policy", required=True, help="policy file relative to the sandbox")
     ap.add_argument("--checkpoint", required=True, type=Path)
-    ap.add_argument("--image", type=Path, default=None, help="Apptainer .sif for the policy process")
-    ap.add_argument("--launcher", choices=["apptainer", "local"], default="apptainer")
-    ap.add_argument("--apptainer-bin", default="apptainer")
-    ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--allow-network", action="store_true", help="skip --network none")
     ap.add_argument("--step-timeout", type=float, default=5.0)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--scenes-root", default=None)
@@ -229,11 +223,6 @@ def main(argv: list[str] | None = None) -> None:
         sandbox_dir=args.sandbox,
         policy_path=args.policy,
         checkpoint=args.checkpoint,
-        image=args.image,
-        launcher=args.launcher,
-        apptainer_bin=args.apptainer_bin,
-        gpu=args.gpu,
-        isolate_network=not args.allow_network,
         device=args.device,
         step_timeout_s=args.step_timeout,
     )

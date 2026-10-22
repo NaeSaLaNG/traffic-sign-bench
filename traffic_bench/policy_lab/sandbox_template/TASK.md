@@ -55,10 +55,13 @@ Lane ids look like `"<from>|<to>|<lane_number>"`; lanes of one road share
 ## Tools
 
 * `list_dir`, `read_file`, `write_file`: this directory only.
-* `run`: a shell command in this directory, inside the same container the
-  policy runs in (no network, ~10 min limit). The CaRL checkpoint is at
-  `/ckpt/carl.pth`. Use `python check_policy.py policies/<file>.py` to
-  catch crashes before spending an evaluation.
+* `run`: a shell command in this directory, in the same environment the
+  policy runs in (~10 min limit). The CaRL checkpoint path is in
+  `$CARL_CHECKPOINT`. Use `python check_policy.py policies/<file>.py` to
+  catch crashes before spending an evaluation. The harness checks every
+  command and file first and refuses paths outside this directory, network
+  and package tools, subprocesses, process control, background jobs and
+  dynamic code (`eval`, `exec`, `__import__`, `importlib`).
 * `evaluate`: drives your policy through a set of simulated episodes and
   returns aggregate metrics per sign family and overall:
   `clean_success_rate` (reached the destination, no collision, no traffic
