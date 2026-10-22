@@ -105,6 +105,29 @@ def _clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:half] + f"\n... [{len(text) - limit} characters cut] ...\n" + text[-half:]
 
 
+def format_tool_call(name: str, arguments, limit: int = 500) -> str:
+    """One console line: tool name plus arguments. Long strings are truncated."""
+    if isinstance(arguments, str):
+        body = " ".join(arguments.split())
+        if len(body) > limit:
+            body = body[:limit] + f"... ({len(arguments)} chars)"
+        return f"{name} arguments={body!r}"
+    if not isinstance(arguments, dict) or not arguments:
+        return name
+    parts = []
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            raw_len = len(value)
+        else:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+            raw_len = len(text)
+        if len(text) > limit:
+            text = text[:limit] + f"... ({raw_len} chars)"
+        parts.append(f"{key}={text!r}")
+    return name + " " + " ".join(parts)
+
+
 class LLMClient:
     def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int):
         self.url = base_url.rstrip("/") + "/chat/completions"
@@ -416,14 +439,16 @@ def run_agent(args: argparse.Namespace) -> dict:
         idle = 0
         for call in calls:
             name = call["function"]["name"]
+            raw_args = call["function"].get("arguments") or "{}"
             try:
-                call_args = json.loads(call["function"].get("arguments") or "{}")
+                call_args = json.loads(raw_args)
                 if not isinstance(call_args, dict):
                     raise ValueError("arguments must be an object")
             except ValueError as exc:
+                print(f"[agent] turn {turn}: {format_tool_call(name, raw_args)}", flush=True)
                 result = f"could not parse arguments: {exc}"
             else:
-                print(f"[agent] turn {turn}: {name}", flush=True)
+                print(f"[agent] turn {turn}: {format_tool_call(name, call_args)}", flush=True)
                 result = tools.call(name, call_args)
             messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
             log({"turn": turn, "tool": name, "result": result[:2000]})

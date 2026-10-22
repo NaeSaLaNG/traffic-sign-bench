@@ -43,6 +43,7 @@ from traffic_bench.policy_lab.agent import (
     SandboxTools,
     _clip,
     _shrink_history,
+    format_tool_call,
     add_launcher_args,
     container_spec,
     strip_reasoning,
@@ -208,14 +209,22 @@ class Gauntlet:
                 proposed = None
                 for call in calls:
                     name = call["function"]["name"]
+                    raw_args = call["function"].get("arguments") or "{}"
                     try:
-                        call_args = json.loads(call["function"].get("arguments") or "{}")
+                        call_args = json.loads(raw_args)
                         if not isinstance(call_args, dict):
                             raise ValueError("arguments must be an object")
                     except ValueError as exc:
+                        print(
+                            f"[gauntlet] round {rnd} turn {turn}: {format_tool_call(name, raw_args)}",
+                            flush=True,
+                        )
                         result = f"could not parse arguments: {exc}"
                     else:
-                        print(f"[gauntlet] round {rnd} turn {turn}: {name}", flush=True)
+                        print(
+                            f"[gauntlet] round {rnd} turn {turn}: {format_tool_call(name, call_args)}",
+                            flush=True,
+                        )
                         if name == "propose":
                             result, proposed = self._gate(call_args.get("policy_path"))
                             if proposed is None:
