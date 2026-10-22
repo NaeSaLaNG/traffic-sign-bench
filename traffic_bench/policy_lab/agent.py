@@ -22,6 +22,7 @@ The model is served by vLLM (or anything with an OpenAI-compatible
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -192,6 +193,7 @@ class EvalConfig:
     scenes_root: str | None = None
     save_gifs: bool = False
     gif_window_m: float = 80.0
+    gif_format: str = "mp4"
     judge_workers: int = 1
     judge_gpus: str | None = None
 
@@ -305,7 +307,8 @@ class SandboxTools:
             cmd += ["--scenes-root", self.evalcfg.scenes_root]
         if self.evalcfg.save_gifs:
             # Private: next to the snapshot, never inside it, so the model cannot see them.
-            cmd += ["--gif-dir", str(eval_dir / "gifs"), "--gif-window", str(self.evalcfg.gif_window_m)]
+            cmd += ["--gif-dir", str(eval_dir / "gifs"), "--gif-window", str(self.evalcfg.gif_window_m),
+                    "--gif-format", self.evalcfg.gif_format]
         with open(eval_dir / "judge.log", "w") as log:
             proc = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         if proc.returncode != 0 or not feedback_path.is_file():
@@ -371,8 +374,41 @@ def strip_reasoning(text: str) -> str:
     return text.strip()
 
 
+COMPACT_ARG_CHARS = 400   # longer string arguments of past tool calls get elided
+KEEP_RECENT_MESSAGES = 6   # ...except in the last few messages
+NOTE_CHARS = 600           # reasoning tail kept in history when the reply has no content
+
+
+def compact_call_args(call: dict, note: str = "") -> bool:
+    """Elide long string arguments (file contents, heredocs) of a past tool call in place.
+
+    The files are on disk, so the model can read them back; what it should not
+    have is dozens of verbatim copies of its own script to paste again.
+    """
+    fn = call.get("function") or {}
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except ValueError:
+        return False
+    if not isinstance(args, dict):
+        return False
+    changed = False
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > COMPACT_ARG_CHARS:
+            args[key] = value[:200] + f"\n... [{len(value)} chars elided{note}]"
+            changed = True
+    if changed:
+        fn["arguments"] = json.dumps(args, ensure_ascii=False)
+    return changed
+
+
 def _shrink_history(messages: list[dict], budget_chars: int) -> None:
-    """Blank out the oldest tool outputs once the transcript gets too long."""
+    """Elide long arguments of older tool calls, then blank the oldest tool outputs if still too long."""
+    for m in messages[2:-KEEP_RECENT_MESSAGES]:
+        if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("_compacted"):
+            for call in m["tool_calls"]:
+                compact_call_args(call, "; read the file if you need it")
+            m["_compacted"] = True
     total = sum(len(json.dumps(m)) for m in messages)
     for m in messages[2:]:
         if total <= budget_chars:
@@ -384,6 +420,83 @@ def _shrink_history(messages: list[dict], budget_chars: int) -> None:
             total += len(m["content"])
 
 
+def assistant_turn(reply: dict) -> tuple[dict, str]:
+    """History entry for an LLM reply, plus its reasoning for the transcript.
+
+    vLLM's reasoning parser puts the thinking in ``reasoning_content`` and chat
+    templates drop it from earlier turns, so a reply with empty ``content``
+    leaves no trace of why a call was made. Keep the tail of the reasoning as
+    the content in that case.
+    """
+    content = reply.get("content") or ""
+    reasoning = reply.get("reasoning_content") or reply.get("reasoning") or ""
+    if not strip_reasoning(content) and reasoning.strip():
+        content = "(my notes) ..." + " ".join(reasoning.split())[-NOTE_CHARS:]
+    assistant = {"role": "assistant", "content": content}
+    if reply.get("tool_calls"):
+        assistant["tool_calls"] = reply["tool_calls"]
+    return assistant, reasoning
+
+
+class RepeatGuard:
+    """Catches a tool call the model already made while the sandbox files are unchanged.
+
+    The key is (tool, arguments, fingerprint of the top-level and ``policies/``
+    files), so re-running a test after editing the policy is fine, but re-running
+    it on the same code is not: it would only return the same output again.
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root).resolve()
+        self.seen: dict[tuple[str, str, str], tuple[int, str]] = {}
+        self.repeats = 0
+
+    def _fingerprint(self) -> str:
+        h = hashlib.sha1()
+        for d in (self.root, self.root / "policies"):
+            if not d.is_dir():
+                continue
+            for f in sorted(d.iterdir()):
+                if f.is_file() and f.stat().st_size <= MAX_FILE_BYTES:
+                    h.update(str(f.relative_to(self.root)).encode())
+                    h.update(hashlib.sha1(f.read_bytes()).digest())
+        return h.hexdigest()
+
+    def _unchanged_write(self, call_args: dict) -> bool:
+        path, content = call_args.get("path"), call_args.get("content")
+        if not isinstance(path, str) or not isinstance(content, str):
+            return False
+        target = (self.root / path).resolve()
+        if self.root not in target.parents or not target.is_file():
+            return False
+        try:
+            return target.read_text(encoding="utf-8") == content
+        except (OSError, UnicodeDecodeError):
+            return False
+
+    def check(self, name: str, call_args: dict) -> tuple[tuple[str, str, str], str | None]:
+        """Key for this call, and a refusal message if it is a repeat (counted)."""
+        key = (name, json.dumps(call_args, sort_keys=True, ensure_ascii=False), self._fingerprint())
+        if name == "write_file" and self._unchanged_write(call_args):
+            self.repeats += 1
+            return key, (f"Not written: {call_args['path']} already has exactly this content, so nothing "
+                         "changed. Rewriting the same file and re-running the same test gives the same output. "
+                         "Change the code, or call `propose`.")
+        prev = self.seen.get(key)
+        if prev is None:
+            return key, None
+        self.repeats += 1
+        turn, result = prev
+        return key, (f"Not run: you made this exact call at turn {turn} and no file at the sandbox top level "
+                     "or in policies/ has changed since, so it would return the same output:\n"
+                     f"{_clip(result, 1500)}\n"
+                     "Repeating it cannot help. Say what that output means, then change the policy "
+                     "(or the experiment), or call `propose`.")
+
+    def remember(self, key: tuple[str, str, str], turn: int, result: str) -> None:
+        self.seen.setdefault(key, (turn, result))
+
+
 def add_hook_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--no-harness-hooks", action="store_true",
                     help="do not check the model's commands and code before they run (hooks.py); "
@@ -392,8 +505,11 @@ def add_hook_args(ap: argparse.ArgumentParser) -> None:
 
 def add_speed_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--save-gifs", action="store_true",
-                    help="save one GIF per episode under eval_NNN/gifs (private; slows evaluation)")
+                    help="save one rollout video per episode under eval_NNN/gifs (private; slows evaluation)")
     ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--gif-format", choices=("mp4", "gif", "both"), default="mp4",
+                    help="with --save-gifs: H.264 MP4 (~10x smaller; needs ffmpeg or imageio-ffmpeg, "
+                         "falls back to GIF without it), the raw GIF, or both")
     ap.add_argument("--judge-workers", type=int, default=1,
                     help="parallel simulator processes per evaluation (CPU-bound; about one per free core)")
     ap.add_argument("--judge-gpus", default=None,
@@ -426,6 +542,7 @@ def run_agent(args: argparse.Namespace) -> dict:
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
+        gif_format=args.gif_format,
         judge_workers=args.judge_workers,
         judge_gpus=args.judge_gpus,
     ), hooks=hooks_enabled(args))
@@ -447,12 +564,10 @@ def run_agent(args: argparse.Namespace) -> dict:
     for turn in range(args.max_turns):
         _shrink_history(messages, args.context_chars)
         reply = llm.chat([{k: v for k, v in m.items() if not k.startswith("_")} for m in messages], TOOLS)
-        assistant = {"role": "assistant", "content": reply.get("content") or ""}
-        calls = reply.get("tool_calls") or []
-        if calls:
-            assistant["tool_calls"] = calls
+        assistant, reasoning = assistant_turn(reply)
+        calls = assistant.get("tool_calls") or []
         messages.append(assistant)
-        log({"turn": turn, "assistant": assistant})
+        log({"turn": turn, "assistant": assistant, **({"reasoning": reasoning} if reasoning else {})})
         if not calls:
             idle += 1
             if idle >= 3:

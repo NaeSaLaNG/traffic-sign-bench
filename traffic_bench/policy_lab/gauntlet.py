@@ -39,9 +39,12 @@ from traffic_bench.policy_lab.agent import (
     TOOLS,
     EvalConfig,
     LLMClient,
+    RepeatGuard,
     SandboxTools,
     _clip,
     _shrink_history,
+    assistant_turn,
+    compact_call_args,
     format_tool_call,
     add_hook_args,
     hooks_enabled,
@@ -69,7 +72,11 @@ when you call `propose`, the policy is evaluated in the simulator and a separate
 critic compares it blind against the current champion. Your job this round is to close \
 the gap named in the brief. Make one focused, well-reasoned change on top of the champion \
 (or a rewrite if the brief calls for it), save it as a NEW file, test it locally with \
-`python check_policy.py <file>` and any small experiments you like, then call `propose`."""
+`python check_policy.py <file>` and any small experiments you like, then call `propose`.
+
+Before every tool call, write one or two sentences: what the last result showed and what \
+you will do next. Do not re-run a command or rewrite a file without changing the code \
+first: the same files give the same output, and the harness refuses exact repeats."""
 
 CRITIC_PROMPT = """You are a harsh, independent reviewer of driving policies. You never see \
 how they were written, only the artifacts: the source of two policies, A and B, and the \
@@ -191,6 +198,9 @@ class Gauntlet:
         check_failures = 0
         idle = 0
         wrote = False
+        last_policy: str | None = None   # newest policies/ file written this round
+        guard = RepeatGuard(self.tools.root)
+        hot_turns = 0                    # turns left at --loop-temperature after a repeat
         try:
             for turn in range(self.args.builder_turns):
                 left = self.args.builder_turns - turn
@@ -202,17 +212,19 @@ class Gauntlet:
                 _shrink_history(messages, self.args.context_chars)
                 try:
                     reply = self.builder_llm.chat([{k: v for k, v in m.items() if not k.startswith("_")}
-                                                   for m in messages], BUILDER_TOOLS)
+                                                   for m in messages], BUILDER_TOOLS,
+                                                  temperature=self.args.loop_temperature if hot_turns else None)
                 except RuntimeError as exc:
                     # A rejected request (e.g. context overflow) ends this round, not the whole gauntlet.
                     print(f"[gauntlet] round {rnd} turn {turn}: {exc}", flush=True)
                     return None, f"builder request rejected: {str(exc)[:300]}"
-                assistant = {"role": "assistant", "content": reply.get("content") or ""}
-                calls = reply.get("tool_calls") or []
-                if calls:
-                    assistant["tool_calls"] = calls
+                hot_turns = max(0, hot_turns - 1)
+                assistant, reasoning = assistant_turn(reply)
+                calls = assistant.get("tool_calls") or []
                 messages.append(assistant)
-                transcript.write(json.dumps({"turn": turn, "assistant": assistant}, ensure_ascii=False) + "\n")
+                transcript.write(json.dumps({"turn": turn, "assistant": assistant,
+                                             **({"reasoning": reasoning} if reasoning else {})},
+                                            ensure_ascii=False) + "\n")
                 if not calls:
                     idle += 1
                     if idle >= 3:
@@ -246,8 +258,22 @@ class Gauntlet:
                                 if check_failures > self.args.check_retries:
                                     return None, "policy failed check_policy.py too many times"
                         elif name in ("list_dir", "read_file", "write_file", "run"):
-                            result = self.tools.call(name, call_args)
-                            wrote = wrote or (name == "write_file" and result.startswith("wrote"))
+                            key, refusal = guard.check(name, call_args)
+                            if refusal is None:
+                                result = self.tools.call(name, call_args)
+                                guard.remember(key, turn, result)
+                                if name == "write_file" and result.startswith("wrote"):
+                                    wrote = True
+                                    path = str(call_args.get("path", ""))
+                                    if path.startswith("policies/") and path.endswith(".py"):
+                                        last_policy = path
+                            else:
+                                left = self.args.max_repeats - guard.repeats
+                                result = refusal + (f" ({left} more repeats end this round.)" if left > 0 else "")
+                                compact_call_args(call, "; a repeat, not run")
+                                hot_turns = 3
+                                print(f"[gauntlet] round {rnd} turn {turn}: repeat #{guard.repeats} refused",
+                                      flush=True)
                         else:
                             result = f"unknown tool {name!r}"
                     messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
@@ -255,9 +281,22 @@ class Gauntlet:
                                                 ensure_ascii=False) + "\n")
                     if proposed:
                         return proposed, "proposed"
+                if guard.repeats >= self.args.max_repeats:
+                    return self._end_stuck_round(rnd, last_policy)
             return None, "builder ran out of turns"
         finally:
             transcript.close()
+
+    def _end_stuck_round(self, rnd: int, last_policy: str | None) -> tuple[str | None, str]:
+        """The builder keeps repeating itself: propose what it wrote, if anything passes the check."""
+        note = f"builder repeated identical calls {self.args.max_repeats} times"
+        if last_policy is None:
+            return None, note + "; no policy written"
+        result, proposed = self._gate(last_policy)
+        print(f"[gauntlet] round {rnd}: {note}; auto-proposing {last_policy}: {result[:200]}", flush=True)
+        if proposed is None:
+            return None, note + f"; {last_policy} failed the check"
+        return proposed, note + f"; auto-proposed {last_policy}"
 
     def _gate(self, policy_path) -> tuple[str, str | None]:
         """check_policy.py, run by the orchestrator, not the builder."""
@@ -431,6 +470,7 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
+        gif_format=args.gif_format,
         judge_workers=args.judge_workers,
         judge_gpus=args.judge_gpus,
     ), hooks=hooks_enabled(args))
@@ -485,6 +525,11 @@ def main() -> None:
     ap.add_argument("--max-rounds", type=int, default=50)
     ap.add_argument("--builder-turns", type=int, default=60, help="tool-call turns per builder round")
     ap.add_argument("--check-retries", type=int, default=3, help="failed check_policy.py proposals per round")
+    ap.add_argument("--max-repeats", type=int, default=4,
+                    help="refused identical tool calls (same arguments, same files) before the round ends; "
+                         "the newest policies/ file written that round is then auto-proposed")
+    ap.add_argument("--loop-temperature", type=float, default=0.8,
+                    help="builder temperature for the 3 turns after a refused repeat")
     ap.add_argument("--min-delta", type=float, default=0.02,
                     help="clean_success_rate margin that decides without the critic")
     ap.add_argument("--patience", type=int, default=6, help="stop after this many rounds without a new champion")

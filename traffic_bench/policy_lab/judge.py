@@ -30,6 +30,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from traffic_bench.eval.run.episode import run_one_episode
+from traffic_bench.eval.run.gif import find_ffmpeg
 from traffic_bench.eval.run.main import _load_rows, _scenes_root
 from traffic_bench.eval.sign_registry import resolve_sign_token
 from traffic_bench.policy_lab.remote_policy import PolicyProcess, RemoteCarlPolicy, SandboxLaunch
@@ -125,6 +126,7 @@ def evaluate(
     seed: int = 0,
     gif_dir: Path | None = None,
     gif_window_m: float = 80.0,
+    gif_format: str = "mp4",
     shard: int = 0,
     num_shards: int = 1,
 ) -> dict:
@@ -136,6 +138,9 @@ def evaluate(
     private_dir.mkdir(parents=True, exist_ok=True)
     if gif_dir is not None:
         Path(gif_dir).mkdir(parents=True, exist_ok=True)
+        if gif_format != "gif" and find_ffmpeg() is None:
+            print("[judge] no ffmpeg (install it or `pip install imageio-ffmpeg`): writing GIFs instead of MP4",
+                  file=sys.stderr, flush=True)
 
     process = PolicyProcess(launch, log_path=private_dir / "policy.log")
     RemoteCarlPolicy.process = process
@@ -169,6 +174,7 @@ def evaluate(
                         ego_sample_seed_base=42,
                         save_gif=gif_path,
                         gif_window_m=gif_window_m,
+                        video_format=gif_format,
                     )
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -233,6 +239,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", required=True, type=Path, help="aggregate feedback JSON")
     ap.add_argument("--gif-dir", type=Path, default=None, help="save one GIF per episode here")
     ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--gif-format", choices=("mp4", "gif", "both"), default="mp4",
+                    help="what to keep per episode: H.264 MP4 (much smaller), the raw GIF, or both")
     ap.add_argument("--workers", type=int, default=1, help="parallel judge processes")
     ap.add_argument("--gpus", default=None,
                     help="comma-separated GPU indices for the policy processes, round-robin over workers")
@@ -265,6 +273,7 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         gif_dir=args.gif_dir,
         gif_window_m=args.gif_window,
+        gif_format=args.gif_format,
         shard=args.shard,
         num_shards=args.num_shards,
     )

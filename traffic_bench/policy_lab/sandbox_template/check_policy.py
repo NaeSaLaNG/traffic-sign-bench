@@ -2,7 +2,8 @@
 
     python check_policy.py policies/my_policy.py [--steps 50] [--checkpoint $CARL_CHECKPOINT]
 
-Catches import errors, exceptions, wrong return types and slow steps. It says
+Catches import errors, exceptions, wrong return types, slow steps and
+CarlDriver contract breaks (observe/controls called twice in a step). It says
 nothing about driving quality; use the evaluate tool for that.
 """
 from __future__ import annotations
@@ -64,6 +65,11 @@ def main() -> None:
                 raise SystemExit(f"step {step}: {name}={v!r} is not a finite number")
             if abs(float(v)) > 1.0:
                 print(f"step {step}: {name}={float(v):.3f} will be clipped to [-1, 1]")
+    if carl.contract_violations:
+        raise SystemExit("CarlDriver contract broken (the steps were driven by a corrupted controller):\n  "
+                         + "\n  ".join(carl.contract_violations)
+                         + "\nDecide the raw action first, then call controls(raw, obs) once; do not fall "
+                           "back to carl.step(obs) after observe() in the same step.")
     print(f"OK: {args.steps} steps, slowest step {worst * 1000:.1f} ms (limit 5000 ms)")
 
 

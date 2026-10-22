@@ -8,10 +8,15 @@ closed-loop acceleration tracker.
 Per step, call ``observe`` once and ``controls`` once (both keep finite
 difference / controller state); ``predict`` is pure and can be called any
 number of times, e.g. on a BEV you edited.
+
+A second ``observe`` or ``controls`` in the same step is recorded in
+``contract_violations`` (it corrupts the finite differences and the
+controller state); ``check_policy.py`` fails on any.
 """
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -47,13 +52,34 @@ class CarlDriver:
         self.config = self._adapter.config
         self.device = device
         self._prev_heading: float | None = None
+        self.contract_violations: list[str] = []
+        self._observed_step = None
+        self._controlled_step = None
 
     def reset(self) -> None:
         self._adapter.reset()
         self._prev_heading = None
+        self._observed_step = None
+        self._controlled_step = None
+
+    @staticmethod
+    def _step_key(obs: dict):
+        step = obs.get("step")
+        return ("step", step) if step is not None else ("obs", id(obs))
+
+    def _violation(self, what: str, key) -> None:
+        msg = f"{what} called twice in step {key[1]}; call it exactly once per step"
+        if msg not in self.contract_violations and len(self.contract_violations) < 20:
+            if not self.contract_violations:
+                print(f"CarlDriver: {msg}", file=sys.stderr, flush=True)
+            self.contract_violations.append(msg)
 
     def observe(self, obs: dict) -> CarlInput:
         """CaRL inputs for this step. Call exactly once per step."""
+        key = self._step_key(obs)
+        if key == self._observed_step:
+            self._violation("observe", key)
+        self._observed_step = key
         ego = obs["ego"]
         heading = float(ego["heading"])
         vx_w, vy_w = (float(v) for v in ego["velocity_xy"])
@@ -104,6 +130,10 @@ class CarlDriver:
         The action you pass here is what CaRL sees as its previous action on
         the next step, so pass the action you actually executed.
         """
+        key = self._step_key(obs)
+        if key == self._controlled_step:
+            self._violation("controls", key)
+        self._controlled_step = key
         raw = np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0)
         self._adapter._last_action = raw.copy()
         steering, throttle = self._adapter.carl_action_to_metadrive(_EgoView(obs["ego"]), raw)

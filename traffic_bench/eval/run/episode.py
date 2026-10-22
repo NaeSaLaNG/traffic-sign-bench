@@ -167,7 +167,7 @@ from traffic_bench.eval.run.env import (
     _wrap_for_policy,
     _manifest_horizon,
 )
-from traffic_bench.eval.run.gif import _topdown_gif_film_and_scaling
+from traffic_bench.eval.run.gif import _topdown_gif_film_and_scaling, renderer_to_mp4
 from traffic_bench.eval.run.policy import _load_policy_models, resolve_model_path
 from traffic_bench.eval.run.score import (
     _compute_smoothness,
@@ -290,6 +290,7 @@ def run_one_episode(
     replay_root: Path | None = None,
     save_gif: Path | None = None,
     gif_window_m: float = 80.0,
+    video_format: str = "gif",
     hide_signs: bool = False,
     draw_path_conflict: bool = False,
     auxiliary_agent: bool = False,
@@ -1168,7 +1169,13 @@ def run_one_episode(
                 save_gif.parent.mkdir(parents=True, exist_ok=True)
                 renderer = getattr(_unwrap_base_env(env), "top_down_renderer", None)
                 if renderer is not None:
-                    renderer.generate_gif(str(save_gif), duration=40)
+                    # video_format: "gif" (default), "mp4" (H.264 next to save_gif, no GIF
+                    # written; falls back to GIF without ffmpeg) or "both".
+                    mp4 = None
+                    if video_format in ("mp4", "both"):
+                        mp4 = renderer_to_mp4(renderer, save_gif.with_suffix(".mp4"), duration_ms=40)
+                    if video_format != "mp4" or mp4 is None:
+                        renderer.generate_gif(str(save_gif), duration=40)
             except Exception:
                 pass
         try:

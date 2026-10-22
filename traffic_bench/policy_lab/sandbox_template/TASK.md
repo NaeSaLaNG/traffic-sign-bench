@@ -33,7 +33,9 @@ class Policy:
   take well under 100 ms).
 * `CarlDriver` (`carl_sandbox/carl.py`) is already reset before `reset` is
   called. Per step: `observe(obs)` once, `predict(inp)` any number of times,
-  `controls(raw_action, obs)` once; or `step(obs)` for plain CaRL.
+  `controls(raw_action, obs)` once; or `step(obs)` for plain CaRL. A second
+  `observe`/`controls` in the same step corrupts the controller state, and
+  `check_policy.py` fails on it.
 * Keep any helper modules inside this directory and import them normally.
 * `policies/carl_baseline.py` is plain CaRL.
 
