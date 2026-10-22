@@ -114,6 +114,8 @@ def evaluate(
     max_episodes: int | None = None,
     max_steps: int = 1500,
     seed: int = 0,
+    gif_dir: Path | None = None,
+    gif_window_m: float = 80.0,
 ) -> dict:
     cfg = OmegaConf.create({"manifest": manifest, "scenes_root": scenes_root})
     rows, manifest_path = _load_rows(cfg)
@@ -121,6 +123,8 @@ def evaluate(
     scenes = _scenes_root(cfg, manifest_path)
     private_dir = Path(private_dir)
     private_dir.mkdir(parents=True, exist_ok=True)
+    if gif_dir is not None:
+        Path(gif_dir).mkdir(parents=True, exist_ok=True)
 
     process = PolicyProcess(launch, log_path=private_dir / "policy.log")
     RemoteCarlPolicy.process = process
@@ -138,6 +142,11 @@ def evaluate(
                         break
                 RemoteCarlPolicy.episode_info = {"episode_index": idx}
                 RemoteCarlPolicy.last_fault = None
+                gif_path = None
+                if gif_dir is not None:
+                    seed_val = int(row.get("seed") or row.get("deterministic_seed") or 0)
+                    gif_path = Path(gif_dir) / (f"{row.get('scene_id') or 'scene'}_v{int(row.get('var_idx', 0) or 0)}"
+                                                f"_s{seed_val}_{Path(launch.policy_path).stem}.gif")
                 try:
                     result = run_one_episode(
                         row=row,
@@ -147,6 +156,8 @@ def evaluate(
                         max_steps=max_steps,
                         ego_variant="default",
                         ego_sample_seed_base=42,
+                        save_gif=gif_path,
+                        gif_window_m=gif_window_m,
                     )
                 except Exception as exc:
                     result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -208,6 +219,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--private-dir", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path, help="aggregate feedback JSON")
+    ap.add_argument("--gif-dir", type=Path, default=None, help="save one GIF per episode here")
+    ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
     args = ap.parse_args(argv)
 
     launch = SandboxLaunch(
@@ -230,6 +243,8 @@ def main(argv: list[str] | None = None) -> None:
         max_episodes=args.max_episodes,
         max_steps=args.max_steps,
         seed=args.seed,
+        gif_dir=args.gif_dir,
+        gif_window_m=args.gif_window,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
