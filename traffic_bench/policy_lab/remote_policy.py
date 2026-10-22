@@ -1,7 +1,8 @@
 """Bridge from the MetaDrive episode loop to a policy running in the sandbox.
 
-``PolicyProcess`` starts ``carl_sandbox.runtime`` inside an Apptainer container
-that sees only the exported sandbox, the CaRL checkpoint and a socket directory.
+``PolicyProcess`` starts ``carl_sandbox.runtime`` as a separate process with
+the exported sandbox as working directory and import root; it reaches the
+judge only through a unix socket.
 ``RemoteCarlPolicy`` is the MetaDrive policy class the episode runner
 instantiates; each step it sends an observation (``observation.py``) and gets
 back two floats. A timeout, a malformed reply or a dead process is a policy
@@ -18,16 +19,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from metadrive.policy.base_policy import BasePolicy
 
-from traffic_bench.policy_lab.container import CKPT_MOUNT, ContainerSpec, apptainer_exec
+from traffic_bench.policy_lab.sandbox_env import sandbox_env
 from traffic_bench.policy_lab.observation import ObservationBuilder
 from traffic_bench.policy_lab.sandbox_template.carl_sandbox.protocol import recv_frame, send_frame
 
-IPC_MOUNT = "/ipc"
 SOCKET_NAME = "policy.sock"
 BRAKE_ACTION = [0.0, -1.0]
 
@@ -37,27 +37,9 @@ class SandboxLaunch:
     sandbox_dir: Path
     policy_path: str                      # relative to sandbox_dir, e.g. "policies/v1.py"
     checkpoint: Path
-    image: Path | None = None             # Apptainer .sif; required unless launcher == "local"
-    launcher: str = "apptainer"           # "apptainer" | "local" (debug only: no isolation)
-    apptainer_bin: str = "apptainer"
-    gpu: bool = False
-    isolate_network: bool = True
     device: str = "cpu"
     ready_timeout_s: float = 300.0
     step_timeout_s: float = 5.0
-    extra_apptainer_args: list[str] = field(default_factory=list)
-
-    def container(self) -> ContainerSpec:
-        if self.image is None:
-            raise ValueError("an Apptainer image is required for launcher=apptainer")
-        return ContainerSpec(
-            image=self.image,
-            checkpoint=self.checkpoint,
-            apptainer_bin=self.apptainer_bin,
-            gpu=self.gpu,
-            isolate_network=self.isolate_network,
-            extra_args=list(self.extra_apptainer_args),
-        )
 
 
 class PolicyProcess:
@@ -75,31 +57,13 @@ class PolicyProcess:
         self.stop()
         self.broken = False
         self._ipc_dir = Path(tempfile.mkdtemp(prefix="policy_lab_ipc_"))
-        os.chmod(self._ipc_dir, 0o777)
-        if self.launch.launcher == "local":
-            sock_arg = str(self._ipc_dir / SOCKET_NAME)
-            argv = [sys.executable, "-m", "carl_sandbox.runtime",
-                    "--socket", sock_arg,
-                    "--policy", self.launch.policy_path,
-                    "--checkpoint", str(Path(self.launch.checkpoint).resolve()),
-                    "--device", self.launch.device]
-            env = {
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(Path(self.launch.sandbox_dir).resolve()),
-                "CARL_NUPLAN_PATH": str(Path(self.launch.sandbox_dir).resolve() / "third_party/CaRL/nuPlan"),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-            cwd = str(Path(self.launch.sandbox_dir).resolve())
-            cmd = argv
-        else:
-            argv = ["python", "-m", "carl_sandbox.runtime",
-                    "--socket", f"{IPC_MOUNT}/{SOCKET_NAME}",
-                    "--policy", self.launch.policy_path,
-                    "--checkpoint", CKPT_MOUNT,
-                    "--device", self.launch.device]
-            cmd = apptainer_exec(self.launch.container(), self.launch.sandbox_dir, argv,
-                                 binds=((self._ipc_dir, IPC_MOUNT),))
-            env, cwd = None, None
+        cmd = [sys.executable, "-m", "carl_sandbox.runtime",
+               "--socket", str(self._ipc_dir / SOCKET_NAME),
+               "--policy", self.launch.policy_path,
+               "--checkpoint", str(Path(self.launch.checkpoint).resolve()),
+               "--device", self.launch.device]
+        env = sandbox_env(self.launch.sandbox_dir, self.launch.checkpoint)
+        cwd = str(Path(self.launch.sandbox_dir).resolve())
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "ab")
         self._proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=cwd)

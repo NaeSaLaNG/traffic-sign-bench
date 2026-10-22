@@ -2,9 +2,11 @@
 
 This process is trusted: it holds the tool implementations and is the only
 thing that touches both sides. The model reaches the world only through the
-tools below: file access confined to the sandbox, shell commands inside the
-Apptainer container, and ``evaluate``, which runs the judge in a separate
+tools below: file access confined to the sandbox, shell commands run in the
+sandbox directory, and ``evaluate``, which runs the judge in a separate
 process on a snapshot of the sandbox and returns aggregate metrics only.
+Model-written code runs on the host, so ``hooks.py`` checks every command and
+file before it runs.
 
 The model is served by vLLM (or anything with an OpenAI-compatible
 ``/v1/chat/completions`` that supports tool calls), e.g.
@@ -12,8 +14,7 @@ The model is served by vLLM (or anything with an OpenAI-compatible
     vllm serve Qwen/Qwen2.5-Coder-32B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
 
     python -m traffic_bench.policy_lab.agent \
-        --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/r1 \
-        --image /scratch/policy_lab/policy.sif \
+        --sandbox $LAB/sandbox --run-dir $LAB/runs/r1 \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --dev-manifest data/runs/policy_lab/dev/manifest.jsonl \
         --llm-url http://gpu-node:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
@@ -23,7 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -32,7 +35,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from traffic_bench.policy_lab.container import ContainerSpec, apptainer_exec
+from traffic_bench.policy_lab.sandbox_env import sandbox_env
+from traffic_bench.policy_lab.hooks import HarnessHooks
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAX_TOOL_OUTPUT = 12_000
@@ -64,8 +68,9 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "run",
-        "description": "Run a shell command in the sandbox root inside the policy container "
-                       "(no network). Returns exit code and output.",
+        "description": "Run a shell command in the sandbox root, in the policy's environment. "
+                       "The harness refuses paths outside the sandbox, network, subprocesses and "
+                       "dynamic code. Returns exit code and output.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"},
             "timeout_s": {"type": "integer", "default": 300}},
@@ -104,23 +109,54 @@ def _clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:half] + f"\n... [{len(text) - limit} characters cut] ...\n" + text[-half:]
 
 
+def format_tool_call(name: str, arguments, limit: int = 500) -> str:
+    """One console line: tool name plus arguments. Long strings are truncated."""
+    if isinstance(arguments, str):
+        body = " ".join(arguments.split())
+        if len(body) > limit:
+            body = body[:limit] + f"... ({len(arguments)} chars)"
+        return f"{name} arguments={body!r}"
+    if not isinstance(arguments, dict) or not arguments:
+        return name
+    parts = []
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            raw_len = len(value)
+        else:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+            raw_len = len(text)
+        if len(text) > limit:
+            text = text[:limit] + f"... ({raw_len} chars)"
+        parts.append(f"{key}={text!r}")
+    return name + " " + " ".join(parts)
+
+
 class LLMClient:
-    def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int):
+    def __init__(self, base_url: str, model: str, api_key: str | None, temperature: float, max_tokens: int,
+                 thinking: bool = True):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.thinking = thinking
 
-    def chat(self, messages: list[dict], tools: list[dict]) -> dict:
-        body = json.dumps({
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             temperature: float | None = None) -> dict:
+        payload = {
             "model": self.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": self.temperature,
+            "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens,
-        }).encode("utf-8")
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        if not self.thinking:
+            # Qwen3-style templates: skip the <think> block, far fewer output tokens per turn.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -129,6 +165,15 @@ class LLMClient:
             try:
                 with urllib.request.urlopen(req, timeout=900) as resp:
                     return json.loads(resp.read())["choices"][0]["message"]
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:2000]
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    # Same body gets the same answer (e.g. prompt over max_model_len); do not retry.
+                    raise RuntimeError(f"LLM request rejected: HTTP {exc.code}: {detail}") from exc
+                if attempt == 4:
+                    raise RuntimeError(f"LLM request failed: HTTP {exc.code}: {detail}") from exc
+                print(f"[agent] LLM request failed (HTTP {exc.code}: {detail[:300]}); retrying", flush=True)
+                time.sleep(10 * (attempt + 1))
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt == 4:
                     raise
@@ -143,16 +188,22 @@ class EvalConfig:
     dev_manifest: str
     max_episodes: int
     max_evals: int
-    gpu: bool
     device: str
     scenes_root: str | None = None
+    save_gifs: bool = False
+    gif_window_m: float = 80.0
+    judge_workers: int = 1
+    judge_gpus: str | None = None
 
 
 class SandboxTools:
-    def __init__(self, sandbox: Path, run_dir: Path, container: ContainerSpec, evalcfg: EvalConfig):
+    def __init__(self, sandbox: Path, run_dir: Path, checkpoint: Path, evalcfg: EvalConfig,
+                 hooks: bool = True):
         self.root = Path(sandbox).resolve()
         self.run_dir = Path(run_dir).resolve()
-        self.container = container
+        # Checks on the model's tool calls before they run (hooks.py); the sandbox as it is now is trusted.
+        self.hooks = HarnessHooks(self.root, self.run_dir) if hooks else None
+        self.checkpoint = Path(checkpoint).resolve()
         self.evalcfg = evalcfg
         self.evals_used = 0
         self.eval_attempts = 0
@@ -210,19 +261,24 @@ class SandboxTools:
 
     def run(self, command: str, timeout_s: int = 300) -> str:
         timeout_s = max(5, min(int(timeout_s), 600))
-        argv = apptainer_exec(self.container, self.root, ["/bin/sh", "-c", command], sandbox_writable=True)
+        # Own process group: a timeout also kills whatever the command started in the background.
+        proc = subprocess.Popen(["/bin/sh", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", env=sandbox_env(self.root, self.checkpoint),
+                                cwd=self.root, start_new_session=True)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout_s,
-                                  env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
-        except subprocess.TimeoutExpired as exc:
-            out = "".join(x.decode(errors="replace") if isinstance(x, bytes) else x
-                          for x in (exc.stdout, exc.stderr) if x)
-            return _clip(f"[timeout after {timeout_s}s]\n{_drop_apptainer_noise(out)}")
-        return _clip(f"exit code {proc.returncode}\n{_drop_apptainer_noise(proc.stdout + proc.stderr)}")
+            out, _ = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, _ = proc.communicate()
+            return _clip(f"[timeout after {timeout_s}s]\n{out}")
+        return _clip(f"exit code {proc.returncode}\n{out}")
 
-    def evaluate(self, policy_path: str) -> str:
-        if self.evals_used >= self.evalcfg.max_evals:
-            return "evaluation budget exhausted; submit your best policy"
+    def run_judge(self, policy_path: str) -> tuple[Path, dict | None, str | None]:
+        """Run the judge on a snapshot of the sandbox, spending one evaluation.
+
+        Returns (eval_dir, feedback, error); feedback is None when the judge
+        failed, and then ``error`` is the message to show the model.
+        """
         policy_file = self._resolve(policy_path)
         rel = str(policy_file.relative_to(self.root))
         self.evals_used += 1
@@ -234,21 +290,22 @@ class SandboxTools:
         cmd = [
             self.evalcfg.judge_python, "-m", "traffic_bench.policy_lab.judge",
             "--sandbox", str(snapshot), "--policy", rel,
-            "--checkpoint", str(self.container.checkpoint),
-            "--image", str(self.container.image),
-            "--apptainer-bin", self.container.apptainer_bin,
+            "--checkpoint", str(self.checkpoint),
             "--manifest", self.evalcfg.dev_manifest,
             "--max-episodes", str(self.evalcfg.max_episodes),
             "--device", self.evalcfg.device,
             "--private-dir", str(eval_dir / "judge"),
             "--out", str(feedback_path),
         ]
-        if self.evalcfg.gpu:
-            cmd.append("--gpu")
-        if not self.container.isolate_network:
-            cmd.append("--allow-network")
+        if self.evalcfg.judge_workers > 1:
+            cmd += ["--workers", str(self.evalcfg.judge_workers)]
+        if self.evalcfg.judge_gpus:
+            cmd += ["--gpus", self.evalcfg.judge_gpus]
         if self.evalcfg.scenes_root:
             cmd += ["--scenes-root", self.evalcfg.scenes_root]
+        if self.evalcfg.save_gifs:
+            # Private: next to the snapshot, never inside it, so the model cannot see them.
+            cmd += ["--gif-dir", str(eval_dir / "gifs"), "--gif-window", str(self.evalcfg.gif_window_m)]
         with open(eval_dir / "judge.log", "w") as log:
             proc = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
         if proc.returncode != 0 or not feedback_path.is_file():
@@ -257,16 +314,29 @@ class SandboxTools:
             self.judge_failures += 1
             if self.judge_failures >= 3:
                 self.evals_used = self.evalcfg.max_evals
-                return "the simulator keeps failing; evaluation is unavailable, submit your best policy"
-            return "evaluation failed on the simulator side (not counted against your budget); retry later"
+                return eval_dir, None, ("the simulator keeps failing; evaluation is unavailable, "
+                                        "submit your best policy")
+            return eval_dir, None, ("evaluation failed on the simulator side "
+                                    "(not counted against your budget); retry later")
         feedback = json.loads(feedback_path.read_text())
         self.history.append({"eval": self.evals_used, "dir": eval_dir.name, "policy": rel,
                              "overall": feedback.get("overall")})
+        return eval_dir, feedback, None
+
+    def policy_log_tail(self, eval_dir: Path, lines: int = 40) -> str:
         policy_log = eval_dir / "judge" / "policy.log"
-        tail = ""
-        if policy_log.is_file():
-            lines = _drop_apptainer_noise(policy_log.read_text(errors="replace")).splitlines()
-            tail = "\n".join(lines[-40:])
+        if not policy_log.is_file():
+            return ""
+        return "\n".join(policy_log.read_text(errors="replace").splitlines()[-lines:])
+
+    def evaluate(self, policy_path: str) -> str:
+        if self.evals_used >= self.evalcfg.max_evals:
+            return "evaluation budget exhausted; submit your best policy"
+        rel = str(self._resolve(policy_path).relative_to(self.root))
+        eval_dir, feedback, error = self.run_judge(rel)
+        if feedback is None:
+            return error
+        tail = self.policy_log_tail(eval_dir)
         left = self.evalcfg.max_evals - self.evals_used
         return _clip(
             f"evaluation #{self.evals_used} of {rel} ({left} left)\n"
@@ -285,16 +355,20 @@ class SandboxTools:
         if fn is None:
             return f"unknown tool {name!r}"
         try:
-            return fn(**args)
+            blocked = self.hooks.before(name, args) if self.hooks else None
+            return blocked or fn(**args)
         except TypeError as exc:
             return f"bad arguments for {name}: {exc}"
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}"
 
 
-def _drop_apptainer_noise(text: str) -> str:
-    """Apptainer's own INFO/WARNING lines name host paths; drop them."""
-    return "\n".join(l for l in text.splitlines() if not l.startswith(("INFO:", "WARNING:", "FATAL:")))
+def strip_reasoning(text: str) -> str:
+    """Drop Qwen3-style ``<think>...</think>`` blocks (vLLM without --reasoning-parser)."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    if "</think>" in text:  # opening tag eaten by the chat template
+        text = text.split("</think>", 1)[1]
+    return text.strip()
 
 
 def _shrink_history(messages: list[dict], budget_chars: int) -> None:
@@ -310,30 +384,53 @@ def _shrink_history(messages: list[dict], budget_chars: int) -> None:
             total += len(m["content"])
 
 
+def add_hook_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--no-harness-hooks", action="store_true",
+                    help="do not check the model's commands and code before they run (hooks.py); "
+                         "model-written code then runs on the host unchecked")
+
+
+def add_speed_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--save-gifs", action="store_true",
+                    help="save one GIF per episode under eval_NNN/gifs (private; slows evaluation)")
+    ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--judge-workers", type=int, default=1,
+                    help="parallel simulator processes per evaluation (CPU-bound; about one per free core)")
+    ap.add_argument("--judge-gpus", default=None,
+                    help="GPU indices for the policy processes during evaluation, e.g. 2 or 1,2")
+    ap.add_argument("--no-think", action="store_true",
+                    help="disable the model's reasoning block (Qwen3 chat_template_kwargs.enable_thinking=false)")
+
+
+def hooks_enabled(args: argparse.Namespace) -> bool:
+    if args.no_harness_hooks:
+        print("[policy_lab] harness hooks OFF: model-written code runs on the host unchecked", flush=True)
+    return not args.no_harness_hooks
+
+
 def run_agent(args: argparse.Namespace) -> dict:
     sandbox = Path(args.sandbox).resolve()
     run_dir = Path(args.run_dir).resolve()
     if run_dir == sandbox or sandbox in run_dir.parents:
         raise SystemExit("--run-dir must be outside the sandbox")
+    if not (sandbox / "TASK.md").is_file():
+        raise SystemExit(f"{sandbox} is not a policy-lab sandbox (no TASK.md); create it with "
+                         f"`python -m traffic_bench.policy_lab.export_sandbox --out {sandbox}`")
     run_dir.mkdir(parents=True, exist_ok=True)
-    container = ContainerSpec(
-        image=Path(args.image).resolve(),
-        checkpoint=Path(args.checkpoint).resolve(),
-        apptainer_bin=args.apptainer_bin,
-        gpu=args.gpu,
-        isolate_network=not args.allow_network,
-    )
-    tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
+    tools = SandboxTools(sandbox, run_dir, Path(args.checkpoint), EvalConfig(
         judge_python=args.judge_python,
         dev_manifest=args.dev_manifest,
         max_episodes=args.episodes_per_eval,
         max_evals=args.max_evals,
-        gpu=args.gpu,
         device=args.device,
         scenes_root=args.scenes_root,
-    ))
+        save_gifs=args.save_gifs,
+        gif_window_m=args.gif_window,
+        judge_workers=args.judge_workers,
+        judge_gpus=args.judge_gpus,
+    ), hooks=hooks_enabled(args))
     llm = LLMClient(args.llm_url, args.model, os.environ.get("POLICY_LAB_LLM_API_KEY"),
-                    args.temperature, args.max_tokens)
+                    args.temperature, args.max_tokens, thinking=not args.no_think)
 
     task = (sandbox / "TASK.md").read_text(encoding="utf-8")
     messages: list[dict] = [
@@ -365,14 +462,16 @@ def run_agent(args: argparse.Namespace) -> dict:
         idle = 0
         for call in calls:
             name = call["function"]["name"]
+            raw_args = call["function"].get("arguments") or "{}"
             try:
-                call_args = json.loads(call["function"].get("arguments") or "{}")
+                call_args = json.loads(raw_args)
                 if not isinstance(call_args, dict):
                     raise ValueError("arguments must be an object")
             except ValueError as exc:
+                print(f"[agent] turn {turn}: {format_tool_call(name, raw_args)}", flush=True)
                 result = f"could not parse arguments: {exc}"
             else:
-                print(f"[agent] turn {turn}: {name}", flush=True)
+                print(f"[agent] turn {turn}: {format_tool_call(name, call_args)}", flush=True)
                 result = tools.call(name, call_args)
             messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
             log({"turn": turn, "tool": name, "result": result[:2000]})
@@ -398,12 +497,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sandbox", required=True)
     ap.add_argument("--run-dir", required=True, help="private transcripts and eval results (outside the sandbox)")
-    ap.add_argument("--image", required=True, help="Apptainer .sif for the policy container")
+    add_hook_args(ap)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--apptainer-bin", default="apptainer")
-    ap.add_argument("--gpu", action="store_true")
-    ap.add_argument("--device", default="cpu", help="torch device for CaRL inside the container")
-    ap.add_argument("--allow-network", action="store_true", help="do not pass --network none")
+    ap.add_argument("--device", default="cpu", help="torch device for CaRL in the policy process")
     ap.add_argument("--dev-manifest", required=True, help="manifest the agent is evaluated on")
     ap.add_argument("--scenes-root", default=None)
     ap.add_argument("--episodes-per-eval", type=int, default=60)
@@ -415,8 +511,10 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max-tokens", type=int, default=8192)
-    ap.add_argument("--context-chars", type=int, default=240_000,
-                    help="approximate transcript budget before old tool outputs are dropped")
+    ap.add_argument("--context-chars", type=int, default=80_000,
+                    help="approximate transcript budget before old tool outputs are dropped "
+                         "(~3 chars per token: 80k fits max_model_len 32768, use ~3x max_model_len)")
+    add_speed_args(ap)
     args = ap.parse_args()
     final = run_agent(args)
     print(json.dumps(final, indent=2, ensure_ascii=False))

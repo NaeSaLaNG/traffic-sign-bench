@@ -6,7 +6,7 @@ standalone copy of ``carl_adapter.py`` and the list of plate names. No git
 history, no ``__pycache__``, no benchmark package. A final scan refuses to
 finish if any exported text file mentions the benchmark or its rule code.
 
-    python -m traffic_bench.policy_lab.export_sandbox --out /scratch/policy_lab/sandbox
+    python -m traffic_bench.policy_lab.export_sandbox --out $LAB/sandbox
 """
 from __future__ import annotations
 
