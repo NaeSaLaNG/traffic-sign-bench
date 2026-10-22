@@ -208,6 +208,12 @@ python -m traffic_bench.policy_lab.gauntlet \
 * `--no-think` turns off Qwen3's reasoning block for the builder (the critic
   keeps it). Turns get much faster; policies may get somewhat worse.
 * `--builder-turns` caps the tool calls per round (default 60).
+* `--judge-workers N` runs each evaluation in N judge processes, each with its
+  own simulator and policy process. MetaDrive and SUMO run on the CPU, so this
+  is what makes evaluations faster; take about one worker per free core
+  (`nproc`) and leave a few for vLLM. `--judge-gpus 2` puts the workers'
+  CaRL processes on GPU 2 (`1,2` spreads them over two cards). The feedback is
+  the same as with one worker.
 * `--save-gifs` writes one GIF per episode to `eval_NNN/gifs/`. They stay on
   the trusted side, but rendering slows each evaluation. `--gif-window` sets the
   view in metres (default 80).

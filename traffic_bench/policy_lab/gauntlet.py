@@ -431,6 +431,8 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
+        judge_workers=args.judge_workers,
+        judge_gpus=args.judge_gpus,
     ), hooks=hooks_enabled(args))
     api_key = os.environ.get("POLICY_LAB_LLM_API_KEY")
     builder_llm = LLMClient(args.llm_url, args.model, api_key, args.temperature, args.max_tokens,

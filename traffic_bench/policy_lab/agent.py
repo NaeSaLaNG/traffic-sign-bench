@@ -192,6 +192,8 @@ class EvalConfig:
     scenes_root: str | None = None
     save_gifs: bool = False
     gif_window_m: float = 80.0
+    judge_workers: int = 1
+    judge_gpus: str | None = None
 
 
 class SandboxTools:
@@ -295,6 +297,10 @@ class SandboxTools:
             "--private-dir", str(eval_dir / "judge"),
             "--out", str(feedback_path),
         ]
+        if self.evalcfg.judge_workers > 1:
+            cmd += ["--workers", str(self.evalcfg.judge_workers)]
+        if self.evalcfg.judge_gpus:
+            cmd += ["--gpus", self.evalcfg.judge_gpus]
         if self.evalcfg.scenes_root:
             cmd += ["--scenes-root", self.evalcfg.scenes_root]
         if self.evalcfg.save_gifs:
@@ -388,6 +394,10 @@ def add_speed_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--save-gifs", action="store_true",
                     help="save one GIF per episode under eval_NNN/gifs (private; slows evaluation)")
     ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--judge-workers", type=int, default=1,
+                    help="parallel simulator processes per evaluation (CPU-bound; about one per free core)")
+    ap.add_argument("--judge-gpus", default=None,
+                    help="GPU indices for the policy processes during evaluation, e.g. 2 or 1,2")
     ap.add_argument("--no-think", action="store_true",
                     help="disable the model's reasoning block (Qwen3 chat_template_kwargs.enable_thinking=false)")
 
@@ -416,6 +426,8 @@ def run_agent(args: argparse.Namespace) -> dict:
         scenes_root=args.scenes_root,
         save_gifs=args.save_gifs,
         gif_window_m=args.gif_window,
+        judge_workers=args.judge_workers,
+        judge_gpus=args.judge_gpus,
     ), hooks=hooks_enabled(args))
     llm = LLMClient(args.llm_url, args.model, os.environ.get("POLICY_LAB_LLM_API_KEY"),
                     args.temperature, args.max_tokens, thinking=not args.no_think)

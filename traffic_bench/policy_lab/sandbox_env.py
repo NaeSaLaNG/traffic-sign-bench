@@ -22,7 +22,7 @@ def sandbox_env(sandbox_dir: Path, checkpoint: Path) -> dict[str, str]:
         "CARL_CHECKPOINT": str(Path(checkpoint).resolve()),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    for key in ("HOME", "TMPDIR", "CUDA_VISIBLE_DEVICES"):
+    for key in ("HOME", "TMPDIR", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         if key in os.environ:
             env[key] = os.environ[key]
     return env

@@ -9,12 +9,20 @@ violation timelines) go to ``--private-dir`` and never reach the agent; the
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --manifest data/runs/policy_lab/dev/manifest.jsonl --max-episodes 60 \
         --private-dir $LAB/judge/run_007 --out $LAB/judge/run_007/feedback.json
+
+``--workers N`` splits the episodes between N judge processes, each with its
+own simulator and policy process (MetaDrive and SUMO run on the CPU, so this
+is what speeds an evaluation up); ``--gpus 2`` or ``--gpus 1,2`` pins their
+policy processes to those cards. The feedback is the same as with one worker.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -117,10 +125,12 @@ def evaluate(
     seed: int = 0,
     gif_dir: Path | None = None,
     gif_window_m: float = 80.0,
+    shard: int = 0,
+    num_shards: int = 1,
 ) -> dict:
     cfg = OmegaConf.create({"manifest": manifest, "scenes_root": scenes_root})
     rows, manifest_path = _load_rows(cfg)
-    rows = sample_rows(rows, max_episodes, seed)
+    rows = sample_rows(rows, max_episodes, seed)[shard::num_shards]
     scenes = _scenes_root(cfg, manifest_path)
     private_dir = Path(private_dir)
     private_dir.mkdir(parents=True, exist_ok=True)
@@ -178,12 +188,18 @@ def evaluate(
 
     if load_error is not None:
         # Remaining rows were never driven: score them as faults.
-        for row in rows[len(episodes):]:
-            episodes.append({"ok": False, "policy_fault": "policy failed to start",
-                             "family": sign_family(row.get("_sign_code"))})
+        with open(private_dir / "episodes.jsonl", "a", encoding="utf-8") as handle:
+            for row in rows[len(episodes):]:
+                episodes.append({"ok": False, "policy_fault": "policy failed to start",
+                                 "family": sign_family(row.get("_sign_code"))})
+                handle.write(json.dumps(episodes[-1]) + "\n")
+    return build_feedback(episodes, launch.policy_path, time.time() - t0, load_error)
+
+
+def build_feedback(episodes: list[dict], policy_path: str, wall_time_s: float, load_error: str | None) -> dict:
     feedback = summarize(episodes)
-    feedback["policy"] = launch.policy_path
-    feedback["wall_time_s"] = round(time.time() - t0, 1)
+    feedback["policy"] = policy_path
+    feedback["wall_time_s"] = round(wall_time_s, 1)
     if load_error is not None:
         feedback["policy_load_error"] = load_error
     faults = []
@@ -217,7 +233,20 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", required=True, type=Path, help="aggregate feedback JSON")
     ap.add_argument("--gif-dir", type=Path, default=None, help="save one GIF per episode here")
     ap.add_argument("--gif-window", type=float, default=80.0, help="GIF view window, metres")
+    ap.add_argument("--workers", type=int, default=1, help="parallel judge processes")
+    ap.add_argument("--gpus", default=None,
+                    help="comma-separated GPU indices for the policy processes, round-robin over workers")
+    ap.add_argument("--shard", type=int, default=0, help=argparse.SUPPRESS)
+    ap.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if args.workers > 1:
+        feedback = run_parallel(args, argv if argv is not None else sys.argv[1:])
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
+        print(json.dumps(feedback["overall"]))
+        return
+    if args.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus.split(",")[0]
 
     launch = SandboxLaunch(
         sandbox_dir=args.sandbox,
@@ -236,10 +265,78 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         gif_dir=args.gif_dir,
         gif_window_m=args.gif_window,
+        shard=args.shard,
+        num_shards=args.num_shards,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
     print(json.dumps(feedback["overall"]))
+
+
+def _drop_options(argv: list[str], names: tuple[str, ...]) -> list[str]:
+    out, skip = [], False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        if tok in names:
+            skip = True
+            continue
+        if any(tok.startswith(n + "=") for n in names):
+            continue
+        out.append(tok)
+    return out
+
+
+def run_parallel(args: argparse.Namespace, argv: list[str]) -> dict:
+    """Run ``--workers`` single-worker judges on interleaved slices of the
+    episodes and merge their results into one feedback."""
+    t0 = time.time()
+    private_dir = Path(args.private_dir)
+    private_dir.mkdir(parents=True, exist_ok=True)
+    gpus = [g.strip() for g in (args.gpus or "").split(",") if g.strip()]
+    base = _drop_options(argv, ("--workers", "--gpus", "--private-dir", "--out", "--shard", "--num-shards"))
+    # Each worker gets an even share of the cores instead of every one using all of them.
+    threads = str(max(1, (os.cpu_count() or 1) // args.workers))
+    procs = []
+    for k in range(args.workers):
+        shard_dir = private_dir / f"w{k:02d}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env.setdefault("OMP_NUM_THREADS", threads)
+        env.setdefault("MKL_NUM_THREADS", threads)
+        if gpus:
+            env["CUDA_VISIBLE_DEVICES"] = gpus[k % len(gpus)]
+        cmd = [sys.executable, "-m", "traffic_bench.policy_lab.judge", *base,
+               "--private-dir", str(shard_dir), "--out", str(shard_dir / "feedback.json"),
+               "--shard", str(k), "--num-shards", str(args.workers)]
+        log = open(shard_dir / "judge.log", "w")
+        procs.append((k, shard_dir, subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT), log))
+    print(f"[judge] {args.workers} workers" + (f" on GPU {','.join(gpus)}" if gpus else ""), flush=True)
+
+    episodes: list[dict] = []
+    load_error = None
+    failed = []
+    for k, shard_dir, proc, log in procs:
+        proc.wait()
+        log.close()
+        out = shard_dir / "feedback.json"
+        if proc.returncode != 0 or not out.is_file():
+            failed.append(f"worker {k} exited with {proc.returncode} (see {shard_dir / 'judge.log'})")
+            continue
+        load_error = load_error or json.loads(out.read_text()).get("policy_load_error")
+        episodes += [json.loads(l) for l in (shard_dir / "episodes.jsonl").read_text().splitlines() if l.strip()]
+    if failed:
+        raise SystemExit("judge workers failed:\n  " + "\n  ".join(failed))
+    # Same private layout as one worker: merged episodes and policy log at the top.
+    with open(private_dir / "episodes.jsonl", "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(e, default=str) + "\n" for e in episodes)
+    with open(private_dir / "policy.log", "w", encoding="utf-8") as f:
+        for k, shard_dir, _, _ in procs:
+            log = shard_dir / "policy.log"
+            if log.is_file():
+                f.write(f"--- worker {k} ---\n" + log.read_text(errors="replace"))
+    return build_feedback(episodes, args.policy, time.time() - t0, load_error)
 
 
 if __name__ == "__main__":
