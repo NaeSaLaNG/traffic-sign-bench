@@ -23,7 +23,7 @@ from pathlib import Path
 
 from metadrive.policy.base_policy import BasePolicy
 
-from traffic_bench.policy_lab.container import CKPT_MOUNT, ContainerSpec, apptainer_exec
+from traffic_bench.policy_lab.container import CKPT_MOUNT, ContainerSpec, apptainer_exec, local_env
 from traffic_bench.policy_lab.observation import ObservationBuilder
 from traffic_bench.policy_lab.sandbox_template.carl_sandbox.protocol import recv_frame, send_frame
 
@@ -83,12 +83,7 @@ class PolicyProcess:
                     "--policy", self.launch.policy_path,
                     "--checkpoint", str(Path(self.launch.checkpoint).resolve()),
                     "--device", self.launch.device]
-            env = {
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(Path(self.launch.sandbox_dir).resolve()),
-                "CARL_NUPLAN_PATH": str(Path(self.launch.sandbox_dir).resolve() / "third_party/CaRL/nuPlan"),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
+            env = local_env(self.launch.sandbox_dir, self.launch.checkpoint)
             cwd = str(Path(self.launch.sandbox_dir).resolve())
             cmd = argv
         else:

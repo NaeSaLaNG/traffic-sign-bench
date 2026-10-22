@@ -5,11 +5,11 @@ violation timelines) go to ``--private-dir`` and never reach the agent; the
 ``--out`` JSON holds only per-family rates, which is all the agent sees.
 
     python -m traffic_bench.policy_lab.judge \
-        --sandbox /scratch/policy_lab/sandbox --policy policies/v3.py \
+        --sandbox $LAB/sandbox --policy policies/v3.py \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-        --image /scratch/policy_lab/policy.sif \
+        --image $LAB/policy.sif \
         --manifest data/runs/policy_lab/dev/manifest.jsonl --max-episodes 60 \
-        --private-dir /scratch/policy_lab/judge/run_007 --out /scratch/policy_lab/judge/run_007/feedback.json
+        --private-dir $LAB/judge/run_007 --out $LAB/judge/run_007/feedback.json
 """
 from __future__ import annotations
 

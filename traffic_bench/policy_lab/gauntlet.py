@@ -17,8 +17,8 @@ The critic sees exactly what the builder may see (code and per-family rates),
 so its gap text cannot leak the private judge output.
 
     python -m traffic_bench.policy_lab.gauntlet \
-        --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/g1 \
-        --image /scratch/policy_lab/policy.sif \
+        --sandbox $LAB/sandbox --run-dir $LAB/runs/g1 \
+        --image $LAB/policy.sif \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --dev-manifest data/runs/policy_lab/dev/manifest.jsonl \
         --llm-url http://gpu-node:8000/v1 --model Qwen3.8-27B-FP8
@@ -43,9 +43,10 @@ from traffic_bench.policy_lab.agent import (
     SandboxTools,
     _clip,
     _shrink_history,
+    add_launcher_args,
+    container_spec,
     strip_reasoning,
 )
-from traffic_bench.policy_lab.container import ContainerSpec
 
 MAX_POLICY_CHARS = 20_000
 
@@ -391,13 +392,7 @@ def run_gauntlet(args: argparse.Namespace) -> dict:
     if run_dir == sandbox or sandbox in run_dir.parents:
         raise SystemExit("--run-dir must be outside the sandbox")
     run_dir.mkdir(parents=True, exist_ok=True)
-    container = ContainerSpec(
-        image=Path(args.image).resolve(),
-        checkpoint=Path(args.checkpoint).resolve(),
-        apptainer_bin=args.apptainer_bin,
-        gpu=args.gpu,
-        isolate_network=not args.allow_network,
-    )
+    container = container_spec(args)
     tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
         judge_python=args.judge_python,
         dev_manifest=args.dev_manifest,
@@ -445,9 +440,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sandbox", required=True)
     ap.add_argument("--run-dir", required=True, help="private transcripts and eval results (outside the sandbox)")
-    ap.add_argument("--image", required=True, help="Apptainer .sif for the policy container")
+    add_launcher_args(ap)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--apptainer-bin", default="apptainer")
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--device", default="cpu", help="torch device for CaRL inside the container")
     ap.add_argument("--allow-network", action="store_true", help="do not pass --network none")

@@ -12,8 +12,8 @@ The model is served by vLLM (or anything with an OpenAI-compatible
     vllm serve Qwen/Qwen2.5-Coder-32B-Instruct --enable-auto-tool-choice --tool-call-parser hermes
 
     python -m traffic_bench.policy_lab.agent \
-        --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/r1 \
-        --image /scratch/policy_lab/policy.sif \
+        --sandbox $LAB/sandbox --run-dir $LAB/runs/r1 \
+        --image $LAB/policy.sif \
         --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
         --dev-manifest data/runs/policy_lab/dev/manifest.jsonl \
         --llm-url http://gpu-node:8000/v1 --model Qwen/Qwen2.5-Coder-32B-Instruct
@@ -33,7 +33,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from traffic_bench.policy_lab.container import ContainerSpec, apptainer_exec
+from traffic_bench.policy_lab.container import ContainerSpec, apptainer_exec, local_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAX_TOOL_OUTPUT = 12_000
@@ -214,10 +214,15 @@ class SandboxTools:
 
     def run(self, command: str, timeout_s: int = 300) -> str:
         timeout_s = max(5, min(int(timeout_s), 600))
-        argv = apptainer_exec(self.container, self.root, ["/bin/sh", "-c", command], sandbox_writable=True)
+        if self.container.launcher == "local":
+            argv = ["/bin/sh", "-c", command]
+            env, cwd = local_env(self.root, self.container.checkpoint), self.root
+        else:
+            argv = apptainer_exec(self.container, self.root, ["/bin/sh", "-c", command], sandbox_writable=True)
+            env, cwd = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}, None
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout_s,
-                                  env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+                                  env=env, cwd=cwd)
         except subprocess.TimeoutExpired as exc:
             out = "".join(x.decode(errors="replace") if isinstance(x, bytes) else x
                           for x in (exc.stdout, exc.stderr) if x)
@@ -242,7 +247,7 @@ class SandboxTools:
             self.evalcfg.judge_python, "-m", "traffic_bench.policy_lab.judge",
             "--sandbox", str(snapshot), "--policy", rel,
             "--checkpoint", str(self.container.checkpoint),
-            "--image", str(self.container.image),
+            "--launcher", self.container.launcher,
             "--apptainer-bin", self.container.apptainer_bin,
             "--manifest", self.evalcfg.dev_manifest,
             "--max-episodes", str(self.evalcfg.max_episodes),
@@ -250,6 +255,8 @@ class SandboxTools:
             "--private-dir", str(eval_dir / "judge"),
             "--out", str(feedback_path),
         ]
+        if self.container.image is not None:
+            cmd += ["--image", str(self.container.image)]
         if self.evalcfg.gpu:
             cmd.append("--gpu")
         if not self.container.isolate_network:
@@ -338,19 +345,35 @@ def _shrink_history(messages: list[dict], budget_chars: int) -> None:
             total += len(m["content"])
 
 
+def add_launcher_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--launcher", choices=["apptainer", "local"], default="apptainer",
+                    help="local runs policies and the run tool without a container (debug only: no isolation)")
+    ap.add_argument("--image", default=None, help="Apptainer .sif for the policy container (launcher=apptainer)")
+    ap.add_argument("--apptainer-bin", default="apptainer")
+
+
+def container_spec(args: argparse.Namespace) -> ContainerSpec:
+    if args.launcher == "apptainer" and not args.image:
+        raise SystemExit("--image is required with --launcher apptainer")
+    if args.launcher == "local":
+        print("[policy_lab] launcher=local: model-written code runs on the host without isolation", flush=True)
+    return ContainerSpec(
+        image=Path(args.image).resolve() if args.image else None,
+        checkpoint=Path(args.checkpoint).resolve(),
+        apptainer_bin=args.apptainer_bin,
+        gpu=args.gpu,
+        isolate_network=not args.allow_network,
+        launcher=args.launcher,
+    )
+
+
 def run_agent(args: argparse.Namespace) -> dict:
     sandbox = Path(args.sandbox).resolve()
     run_dir = Path(args.run_dir).resolve()
     if run_dir == sandbox or sandbox in run_dir.parents:
         raise SystemExit("--run-dir must be outside the sandbox")
     run_dir.mkdir(parents=True, exist_ok=True)
-    container = ContainerSpec(
-        image=Path(args.image).resolve(),
-        checkpoint=Path(args.checkpoint).resolve(),
-        apptainer_bin=args.apptainer_bin,
-        gpu=args.gpu,
-        isolate_network=not args.allow_network,
-    )
+    container = container_spec(args)
     tools = SandboxTools(sandbox, run_dir, container, EvalConfig(
         judge_python=args.judge_python,
         dev_manifest=args.dev_manifest,
@@ -426,9 +449,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sandbox", required=True)
     ap.add_argument("--run-dir", required=True, help="private transcripts and eval results (outside the sandbox)")
-    ap.add_argument("--image", required=True, help="Apptainer .sif for the policy container")
+    add_launcher_args(ap)
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--apptainer-bin", default="apptainer")
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--device", default="cpu", help="torch device for CaRL inside the container")
     ap.add_argument("--allow-network", action="store_true", help="do not pass --network none")

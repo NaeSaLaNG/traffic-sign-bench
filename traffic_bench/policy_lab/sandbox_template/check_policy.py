@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import numpy as np
@@ -44,7 +45,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("policy")
     ap.add_argument("--steps", type=int, default=50)
-    ap.add_argument("--checkpoint", default="/ckpt/carl.pth")
+    ap.add_argument("--checkpoint", default=os.environ.get("CARL_CHECKPOINT", "/ckpt/carl.pth"))
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 

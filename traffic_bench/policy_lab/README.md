@@ -49,26 +49,35 @@ How this holds:
 
 ## Running it on the cluster
 
+Pick a writable working directory for images, sandboxes and runs. It must be
+outside the repository (`export_sandbox` refuses a path inside it), so a sibling
+of the checkout works well. Run this from the repository root:
+
+```bash
+export LAB=/home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril/scratch/policy_lab
+mkdir -p $LAB
+```
+
 1. Build the policy image once (it contains no benchmark code):
 
    ```bash
-   apptainer build /scratch/policy_lab/policy.sif traffic_bench/policy_lab/apptainer/policy.def
+   apptainer build $LAB/policy.sif traffic_bench/policy_lab/apptainer/policy.def
    ```
 
 2. Export the sandbox outside the repository:
 
    ```bash
    git submodule update --init third_party/CaRL
-   python -m traffic_bench.policy_lab.export_sandbox --out /scratch/policy_lab/sandbox
+   python -m traffic_bench.policy_lab.export_sandbox --out $LAB/sandbox
    ```
 
 3. Check that plain CaRL loads in the container (catches missing pip packages):
 
    ```bash
-   apptainer exec --containall --no-home --bind /scratch/policy_lab/sandbox:/work \
+   apptainer exec --containall --no-home --bind $LAB/sandbox:/work \
        --bind checkpoints/carl/nuplan_51479_1B/model_best.pth:/ckpt/carl.pth:ro --pwd /work \
        --env PYTHONPATH=/work,CARL_NUPLAN_PATH=/work/third_party/CaRL/nuPlan \
-       /scratch/policy_lab/policy.sif python check_policy.py policies/carl_baseline.py
+       $LAB/policy.sif python check_policy.py policies/carl_baseline.py
    ```
 
 4. Serve the model with tool calling. For Qwen-style chat templates:
@@ -86,8 +95,8 @@ How this holds:
    ```bash
    python -m traffic_bench.eval manifest sign=crosswalk paths.split=train
    python -m traffic_bench.policy_lab.agent \
-      --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/crosswalk \
-      --image /scratch/policy_lab/policy.sif \
+      --sandbox $LAB/sandbox --run-dir $LAB/runs/crosswalk \
+      --image $LAB/policy.sif \
       --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
       --gpu --device cuda \
       --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
@@ -102,14 +111,21 @@ How this holds:
 6. Score the submission on the held-out manifest:
 
    ```bash
-   python -m traffic_bench.policy_lab.judge --sandbox /scratch/policy_lab/runs/r1/final/sandbox \
+   python -m traffic_bench.policy_lab.judge --sandbox $LAB/runs/r1/final/sandbox \
        --policy <submitted policy> --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-       --image /scratch/policy_lab/policy.sif --manifest <test manifest.jsonl> \
-       --private-dir /scratch/policy_lab/runs/r1/test --out /scratch/policy_lab/runs/r1/test/feedback.json
+       --image $LAB/policy.sif --manifest <test manifest.jsonl> \
+       --private-dir $LAB/runs/r1/test --out $LAB/runs/r1/test/feedback.json
    ```
 
    `--launcher local` runs the policy without a container. It is for
-   debugging only and gives no isolation.
+   debugging only and gives no isolation. `agent.py` and `gauntlet.py`
+   accept it too (then `--image` is not needed): the policy, `check_policy.py`
+   and the agent's `run` tool use the orchestrator's interpreter on the host,
+   with the sandbox as working directory, `CARL_CHECKPOINT` pointing at the
+   checkpoint and `CUDA_VISIBLE_DEVICES` passed through. Model-written code can
+   then read and write anything you can, and reach the network. Use it only
+   where Apptainer cannot run (e.g. pods that forbid mount namespaces), and
+   watch the run.
 
 ## Gauntlet loop
 
@@ -151,8 +167,8 @@ vllm serve /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril
 
 ```bash
 python -m traffic_bench.policy_lab.gauntlet \
-   --sandbox /scratch/policy_lab/sandbox --run-dir /scratch/policy_lab/runs/g1 \
-   --image /scratch/policy_lab/policy.sif \
+   --sandbox $LAB/sandbox --run-dir $LAB/runs/g1 \
+   --image $LAB/policy.sif \
    --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
    --gpu --device cuda \
    --dev-manifest data/runs/crosswalk/train/real_manifest.jsonl \
@@ -186,15 +202,15 @@ server can serve all signs.
 2. Export a sandbox for this sign:
 
    ```bash
-   python -m traffic_bench.policy_lab.export_sandbox --out /scratch/policy_lab/sandbox_$SIGN
+   python -m traffic_bench.policy_lab.export_sandbox --out $LAB/sandbox_$SIGN
    ```
 
 3. Run the gauntlet on the train manifest:
 
    ```bash
    python -m traffic_bench.policy_lab.gauntlet \
-      --sandbox /scratch/policy_lab/sandbox_$SIGN --run-dir /scratch/policy_lab/runs/$SIGN \
-      --image /scratch/policy_lab/policy.sif \
+      --sandbox $LAB/sandbox_$SIGN --run-dir $LAB/runs/$SIGN \
+      --image $LAB/policy.sif \
       --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
       --gpu --device cuda \
       --dev-manifest data/runs/$SIGN/train/real_manifest.jsonl \
@@ -202,17 +218,17 @@ server can serve all signs.
       --llm-url http://<vllm host>:8000/v1 --model Qwen3.8-27B-FP8
    ```
 
-   Progress is in `/scratch/policy_lab/runs/$SIGN/progress.md`.
+   Progress is in `$LAB/runs/$SIGN/progress.md`.
 
 4. Score the champion on the test manifest:
 
    ```bash
-   POLICY=$(python -c "import json;print(json.load(open('/scratch/policy_lab/runs/$SIGN/final.json'))['submitted']['policy_path'])")
-   python -m traffic_bench.policy_lab.judge --sandbox /scratch/policy_lab/runs/$SIGN/final/sandbox \
+   POLICY=$(python -c "import json;print(json.load(open('$LAB/runs/$SIGN/final.json'))['submitted']['policy_path'])")
+   python -m traffic_bench.policy_lab.judge --sandbox $LAB/runs/$SIGN/final/sandbox \
       --policy $POLICY --checkpoint checkpoints/carl/nuplan_51479_1B/model_best.pth \
-      --image /scratch/policy_lab/policy.sif --gpu --device cuda \
+      --image $LAB/policy.sif --gpu --device cuda \
       --manifest data/runs/$SIGN/test/real_manifest.jsonl \
-      --private-dir /scratch/policy_lab/runs/$SIGN/test --out /scratch/policy_lab/runs/$SIGN/test/feedback.json
+      --private-dir $LAB/runs/$SIGN/test --out $LAB/runs/$SIGN/test/feedback.json
    ```
 
 Every evaluation uses the same dev episodes. If the train manifest has fewer
