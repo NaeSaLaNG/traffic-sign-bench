@@ -15,14 +15,21 @@ def sandbox_env(sandbox_dir: Path, checkpoint: Path) -> dict[str, str]:
     interpreter; nothing else of the orchestrator's environment (API keys,
     tokens) is passed on."""
     root = Path(sandbox_dir).resolve()
+    home = root / ".home"
+    temp = root / ".tmp"
+    home.mkdir(exist_ok=True)
+    temp.mkdir(exist_ok=True)
     env = {
-        "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "/usr/bin:/bin")]),
+        "PATH": os.pathsep.join([str(Path(sys.executable).parent), "/usr/bin", "/bin"]),
         "PYTHONPATH": str(root),
         "CARL_NUPLAN_PATH": str(root / "third_party" / "CaRL" / "nuPlan"),
         "CARL_CHECKPOINT": str(Path(checkpoint).resolve()),
         "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": str(home),
+        "TMPDIR": str(temp),
+        "XDG_CACHE_HOME": str(home / ".cache"),
     }
-    for key in ("HOME", "TMPDIR", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    for key in ("CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         if key in os.environ:
             env[key] = os.environ[key]
     return env

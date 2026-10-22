@@ -24,9 +24,9 @@ well a policy does only from aggregate metrics.
 |---|---|
 | `TASK.md`, `carl_sandbox/` (CaRL wrapper, runtime), `check_policy.py`, `policies/` | `traffic_bench/` entirely: `signs/**` (violation logic, zones, thresholds), `eval/**`, `agents/compliance/**`, `*_rule.py`, `curve_aware_idm.py`, `oracle/`, `finetune/`, `scripts/`, docs, READMEs |
 | `third_party/CaRL/nuPlan` (upstream CaRL code) | `.git` and its history, `__pycache__`, `*.egg-info`, `data/runs/` |
-| the CaRL checkpoint, at `$CARL_CHECKPOINT` | `$HOME` (HF token, `~/.cursor`, shell history), host env vars, the NFS repo path |
+| the CaRL checkpoint, at `$CARL_CHECKPOINT` | the operator's home directory (HF token, `~/.cursor`, shell history), host env vars, the NFS repo path |
 | `plates.txt`: names of the plates that can appear | the network (refused by the harness hooks) |
-| per-family rates: `clean_success_rate`, `success_rate`, `no_sign_violation_rate`, `collision_rate`, `out_of_road_rate`, `policy_fault_rate`, `mean_route_completion_pct` | violation timelines, violation texts, GIFs, per-episode results, judge logs |
+| per-family rates: `clean_success_rate`, `success_rate`, `no_sign_violation_rate`, `collision_rate`, `out_of_road_rate`, `policy_fault_rate`, `mean_route_completion_pct` | violation timelines, violation texts, GIFs, MP4s, per-episode results, judge logs and fault tracebacks |
 
 How this holds:
 
@@ -41,9 +41,10 @@ How this holds:
   unpickles anything the policy sends.
 * **Trusted orchestrator.** `agent.py` runs the tools. File access resolves
   symlinks and stays inside the sandbox, shell commands run in the sandbox
-  directory with a clean environment (no API keys or tokens), and evaluations
-  run on a snapshot of the sandbox. Judge output is reduced to the aggregate
-  JSON before it reaches the model.
+  directory with a clean environment (no API keys or tokens; `HOME` and
+  `TMPDIR` point inside the sandbox), and evaluations run on a snapshot of the
+  sandbox. The output hook in `hooks.py` copies only numeric `overall` and
+  `by_family` metrics before judge output reaches the builder or critic.
 * **Harness hooks.** There is no container: model-written code runs on the
   host as your user. `hooks.py` checks every tool call before it runs and
   refuses, with the reason, instead of executing:
@@ -68,6 +69,102 @@ How this holds:
 * **Faults are failures.** A crash, timeout (5 s per step), NaN or a failed load
   counts as a failed episode, so a policy cannot drop hard scenes by crashing on
   them.
+
+## Crosswalk policy lab: production cluster run
+
+This is the one-command path for a crosswalk-only gauntlet. The operator runs
+it after pulling a revision that contains `run_crosswalk.py`. The Qwen server
+already runs separately on the cluster at `http://localhost:8000/v1`; this
+command connects to it and never starts or stops it. Use the existing
+`andreev-12-env` environment. The checkout must have crosswalk scenes and the
+CaRL checkpoint at `checkpoints/carl/nuplan_51479_1B/model_best.pth` (or pass
+`--checkpoint`). The working directory must be writable and **outside** the
+checkout. Keep secrets and private benchmark data out of the sandbox. With
+video output enabled, the environment also needs `ffmpeg` with H.264 support,
+or `opencv-python` plus `Pillow` for the MP4 fallback.
+
+```bash
+conda activate andreev-12-env
+git pull
+git submodule update --init third_party/CaRL
+curl -fsS http://localhost:8000/v1/models
+
+# Preflight: print the commands and paths without running a simulation.
+python -m traffic_bench.policy_lab.run_crosswalk --split valid --iterations 1 --dry-run
+
+# One-round smoke run. Replace the work directory with a writable cluster path.
+python -m traffic_bench.policy_lab.run_crosswalk \
+  --split valid --iterations 1 --episodes-per-eval 3 \
+  --work-dir /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril/scratch/policy_lab \
+  --judge-workers 1 --judge-gpus 1
+
+# Full run on the standard train scene pool.
+python -m traffic_bench.policy_lab.run_crosswalk \
+  --split valid --iterations 10 --episodes-per-eval 60 \
+  --work-dir /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril/scratch/policy_lab \
+  --judge-workers 4 --judge-gpus 1
+
+# Optional: run the same search on the standard test scene pool.
+python -m traffic_bench.policy_lab.run_crosswalk \
+  --split test --iterations 10 --episodes-per-eval 60 \
+  --work-dir /home/jovyan/shares/SR006.nfs2/zinkovich/students/sleptsov-and/gavril/scratch/policy_lab \
+  --judge-workers 4 --judge-gpus 1
+```
+
+`--split test` selects the standard test manifest with the same gauntlet loop.
+The agent then improves policies using aggregate test scores, so that run is
+**not an independent held-out assessment**. The benchmark has no `valid`
+scene pool: this command maps `valid` to the standard `train` manifest and
+`test` to `test`. It creates a missing standard manifest with
+`python -m traffic_bench.eval manifest sign=crosswalk paths.split=<train|test>`;
+an existing manifest is used as-is and never overwritten. Use `--manifest`
+to supply a prebuilt manifest explicitly.
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--split` | `valid` | `valid` → train, `test` → test |
+| `--iterations` | `10` | Maximum builder rounds; evaluation budget is N + 1 including baseline; gauntlet may stop early on its normal criteria |
+| `--episodes-per-eval` | `60` | Same sampled episodes for every policy in the run |
+| `--work-dir` | sibling `policy_lab_runs` | Private sandboxes, logs and results outside the checkout |
+| `--run-name` | UTC timestamp | Unique name; an existing run is never overwritten |
+| `--llm-url` | `http://localhost:8000/v1` | Existing OpenAI-compatible Qwen server |
+| `--model` | auto | Automatically uses the sole model returned by `/v1/models`; required if several models are served |
+| `--checkpoint` | `checkpoints/carl/nuplan_51479_1B/model_best.pth` | CaRL weights |
+| `--judge-workers`, `--judge-gpus` | `1`, unset | Parallel simulator workers and GPU selection for policy processes |
+| `--builder-turns`, `--context-chars`, `--min-delta`, `--no-think` | gauntlet-oriented defaults | Search controls; see `--help` |
+| `--no-gifs` | off | Disable GIF and MP4 rendering when speed matters |
+
+Every run writes to `<work-dir>/runs/crosswalk/<split>/<run-name>/`. Watch
+`progress.md` while it runs. `final.json` names the submitted champion, whose
+code is in `final/sandbox/`. Each evaluation writes `eval_NNN/gifs/*.gif` and
+converts each GIF to a neighbouring `.mp4`. `gifs.html` is an operator-facing
+video gallery, created at the end; open it through the cluster file browser.
+GIFs, MP4s, `eval_NNN/judge/episodes.jsonl`, `judge.log`, `feedback.json`,
+`hooks.jsonl`, `evaluation_errors.log`,
+quarantine files, transcripts and critic replies remain outside the agent
+sandbox. A failed simulator evaluation is reported to the model by a generic
+status; inspect the private judge log for the cause.
+
+The builder can list/read/write sandbox files, run checked local commands and
+propose a policy. Input hooks reject path escapes, network/package/VCS/process
+commands and unsafe Python imports or execution. Before the builder or critic
+sees an evaluation, the output hook selects only numeric aggregate rates and
+episode counts from `overall` and `by_family`; it drops paths, per-episode
+results, stdout/stderr, exceptions and GIFs. Rejected calls are logged in
+`hooks.jsonl` and unsafe files are quarantined. The cluster command never
+disables these hooks. These are application guardrails, **not a system
+sandbox**: model-written Python still runs with the operator's Unix
+permissions, so keep sensitive files inaccessible to that account when
+possible.
+
+If preflight fails, first check the named missing checkpoint or CaRL submodule,
+then that `curl .../v1/models` returns the expected model. If several models
+are served, pass `--model` with an exact returned ID. For simulator errors,
+inspect `eval_NNN/judge.log`; for rejected agent actions, inspect
+`hooks.jsonl`. MP4 conversion failures are recorded in
+`eval_NNN/media_errors.log`; the final command exits with an error while
+retaining the policy and GIF results. If the run name already exists, choose a
+new `--run-name`.
 
 ## Running it on the cluster
 
@@ -214,9 +311,10 @@ python -m traffic_bench.policy_lab.gauntlet \
   (`nproc`) and leave a few for vLLM. `--judge-gpus 2` puts the workers'
   CaRL processes on GPU 2 (`1,2` spreads them over two cards). The feedback is
   the same as with one worker.
-* `--save-gifs` writes one GIF per episode to `eval_NNN/gifs/`. They stay on
-  the trusted side, but rendering slows each evaluation. `--gif-window` sets the
-  view in metres (default 80).
+* `--save-gifs` writes one GIF per episode to `eval_NNN/gifs/` and converts it
+  to MP4 beside the GIF. They stay on the trusted side, but rendering and
+  conversion slow each evaluation. `--gif-window` sets the view in metres
+  (default 80).
 
 `runs/g1/` gets `progress.md` (live champion and round table),
 `gauntlet.jsonl`, `round_NN_builder.jsonl`, `round_NN_critic.json` (the

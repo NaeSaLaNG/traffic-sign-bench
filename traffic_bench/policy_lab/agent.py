@@ -36,12 +36,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from traffic_bench.policy_lab.sandbox_env import sandbox_env
-from traffic_bench.policy_lab.hooks import HarnessHooks
+from traffic_bench.policy_lab.hooks import HarnessHooks, public_feedback
+from traffic_bench.policy_lab.media import convert_gifs
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAX_TOOL_OUTPUT = 12_000
 MAX_FILE_BYTES = 400_000
-SNAPSHOT_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".cache")
+SNAPSHOT_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".cache", ".home", ".tmp")
 
 TOOLS = [
     {"type": "function", "function": {
@@ -308,6 +309,12 @@ class SandboxTools:
             cmd += ["--gif-dir", str(eval_dir / "gifs"), "--gif-window", str(self.evalcfg.gif_window_m)]
         with open(eval_dir / "judge.log", "w") as log:
             proc = subprocess.run(cmd, cwd=REPO_ROOT, stdout=log, stderr=subprocess.STDOUT)
+        if self.evalcfg.save_gifs:
+            _, media_errors = convert_gifs(eval_dir / "gifs")
+            if media_errors:
+                (eval_dir / "media_errors.log").write_text("\n".join(media_errors) + "\n", encoding="utf-8")
+                print(f"[policy_lab] {len(media_errors)} GIF(s) could not be converted to MP4; "
+                      f"see {eval_dir / 'media_errors.log'}", flush=True)
         if proc.returncode != 0 or not feedback_path.is_file():
             # Judge internals stay private; the agent only learns it failed.
             self.evals_used -= 1
@@ -323,25 +330,24 @@ class SandboxTools:
                              "overall": feedback.get("overall")})
         return eval_dir, feedback, None
 
-    def policy_log_tail(self, eval_dir: Path, lines: int = 40) -> str:
-        policy_log = eval_dir / "judge" / "policy.log"
-        if not policy_log.is_file():
-            return ""
-        return "\n".join(policy_log.read_text(errors="replace").splitlines()[-lines:])
-
     def evaluate(self, policy_path: str) -> str:
         if self.evals_used >= self.evalcfg.max_evals:
             return "evaluation budget exhausted; submit your best policy"
         rel = str(self._resolve(policy_path).relative_to(self.root))
-        eval_dir, feedback, error = self.run_judge(rel)
+        try:
+            _, feedback, error = self.run_judge(rel)
+        except Exception as exc:
+            # Do not let simulator paths or tracebacks escape via call()'s generic handler.
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.run_dir / "evaluation_errors.log", "a", encoding="utf-8") as log:
+                log.write(f"{type(exc).__name__}: {exc}\n")
+            return "evaluation failed on the simulator side; inspect private logs"
         if feedback is None:
             return error
-        tail = self.policy_log_tail(eval_dir)
         left = self.evalcfg.max_evals - self.evals_used
         return _clip(
             f"evaluation #{self.evals_used} of {rel} ({left} left)\n"
-            + json.dumps(feedback, indent=1)
-            + (f"\n--- policy stdout/stderr (last lines) ---\n{tail}" if tail else "")
+            + json.dumps(public_feedback(feedback), indent=1)
         )
 
     def submit(self, policy_path: str, summary: str) -> str:

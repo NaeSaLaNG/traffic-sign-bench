@@ -30,12 +30,49 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import re
 import shlex
 import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# The only judge fields allowed to cross into an LLM conversation.
+PUBLIC_METRICS = (
+    "clean_success_rate", "success_rate", "no_sign_violation_rate",
+    "collision_rate", "out_of_road_rate", "policy_fault_rate",
+    "mean_route_completion_pct",
+)
+PUBLIC_FAMILIES = frozenset(("junction", "roundabout", "blocked", "dual_path",
+                             "crosswalk", "detour", "speed", "other"))
+
+
+def public_feedback(feedback: dict) -> dict:
+    """Output hook: copy numeric aggregates only; never forward judge text or paths."""
+    def rates(raw: object) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        episodes = raw.get("episodes")
+        if isinstance(episodes, int) and not isinstance(episodes, bool) and episodes >= 0:
+            out["episodes"] = episodes
+        for key in PUBLIC_METRICS:
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                out[key] = value
+        return out
+
+    families = feedback.get("by_family")
+    if not isinstance(families, dict):
+        families = {}
+    return {
+        "overall": rates(feedback.get("overall")),
+        "by_family": {
+            name: rates(metrics) for name, metrics in families.items()
+            if name in PUBLIC_FAMILIES
+        },
+    }
 
 # Absolute paths a command or policy may legitimately name besides the sandbox.
 ALLOWED_ABSOLUTE = ("/dev/null", "/dev/stdout", "/dev/stderr", "/bin/sh", "/bin/bash", "/usr/bin/env")
